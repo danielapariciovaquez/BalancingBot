@@ -9,7 +9,7 @@ PORT = "/dev/ttyUSB0"
 BAUD = 38400
 TIMEOUT_S = 0.2
 
-ADDRS = [0x01, 0x02]  # tus dos motores
+ADDRS = [0x02, 0x02]  # tus dos motores
 
 # Prueba de movimiento
 TEST_RPM = 10
