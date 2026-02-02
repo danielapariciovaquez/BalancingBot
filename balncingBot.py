@@ -30,8 +30,8 @@ RPM_MAX = 400
 
 # Si quieres que al iniciar haga enable y work mode:
 DO_INIT = True
-WORK_MODE = 0x05     # SR_vFOC
-ENABLE_ON = True     # F3=01
+WORK_MODE = 0x05     # SR_vFOC (bus FOC mode)
+ENABLE_ON = True     # F3=01 (shaft lock)
 
 # ============================================================
 # Protocolo MKS RS485: FA addr code ... CRC (checksum8)
@@ -45,6 +45,12 @@ def build_frame(addr: int, code: int, data: bytes = b"") -> bytes:
     return base + bytes([checksum8(base)])
 
 def encode_f6_speed(rpm_signed: int, acc: int) -> bytes:
+    """
+    F6 payload: Byte4 Byte5 acc
+      dir_bit = 1 si rpm_signed < 0
+      Byte4 = (dir<<7) | ((speed>>8) & 0x0F)
+      Byte5 = speed & 0xFF
+    """
     rpm = int(rpm_signed)
     dir_bit = 1 if rpm < 0 else 0
     speed = abs(rpm)
@@ -124,7 +130,7 @@ def clamp_int(x: int, lo: int, hi: int) -> int:
 
 def print_help():
     print(
-        "\n=== MKS SERVO42D RS485 - Test de giro / signos ===\n"
+        "\n=== MKS SERVO42D RS485 - Test de giro / ajuste de signos ===\n"
         "Controles:\n"
         "  1  -> seleccionar Motor 1\n"
         "  2  -> seleccionar Motor 2\n"
@@ -135,12 +141,9 @@ def print_help():
         "  a  -> STOP a ambos\n"
         "  r  -> invertir signo del seleccionado (multiplica por -1)\n"
         "  q  -> salir (hace STOP)\n\n"
-        "Cómo usarlo:\n"
-        "  - Pon el robot con ruedas al aire o sujeto.\n"
-        "  - Selecciona 1, pulsa + varias veces: observa el sentido físico.\n"
-        "  - Selecciona 2, pulsa + varias veces: observa el sentido físico.\n"
-        "  - Ajusta con r si quieres invertir rápidamente.\n"
-        "  - Objetivo típico: que con '+' (rpm positiva) ambas ruedas hagan 'avance' físico.\n"
+        "Objetivo típico:\n"
+        "  - Conseguir que con rpm positiva (+) ambas ruedas hagan 'avance' físico.\n"
+        "  - Los signos finales se imprimen al salir.\n"
     )
 
 def main():
@@ -154,13 +157,11 @@ def main():
 
     bus = MksRs485(RS485_PORT, RS485_BAUD, RS485_TIMEOUT_S, INTER_FRAME_DELAY_S)
 
-    # Estado y signos "en vivo"
     st = State(m1_rpm=0, m2_rpm=0, selected=0)
     m1_sign = +1
     m2_sign = +1
 
     def apply():
-        # aplica rpm actuales con signos
         bus.speed(M1_ADDR, m1_sign * st.m1_rpm, F6_ACC)
         bus.speed(M2_ADDR, m2_sign * st.m2_rpm, F6_ACC)
 
@@ -181,7 +182,6 @@ def main():
 
     try:
         if DO_INIT:
-            # Modo + enable
             for addr in (M1_ADDR, M2_ADDR):
                 bus.set_work_mode(addr, WORK_MODE)
             if ENABLE_ON:
@@ -191,11 +191,9 @@ def main():
         print_help()
         print(f"[CFG] PORT={RS485_PORT} BAUD={RS485_BAUD}  M1={M1_ADDR} M2={M2_ADDR}  F6_ACC={F6_ACC}")
         print(f"[CFG] RPM_STEP={RPM_STEP} RPM_MAX={RPM_MAX}")
-        print("\nEstado: (seleccion=ambos)")
 
         with RawKey() as rk:
             while not stop_flag["stop"]:
-                # imprimir estado
                 sel = "AMBOS" if st.selected == 0 else ("M1" if st.selected == 1 else "M2")
                 line = (
                     f"\rSEL={sel:5s} | "
@@ -209,7 +207,8 @@ def main():
 
                 if ch == "q":
                     break
-                elif ch == "1":
+
+                if ch == "1":
                     st.selected = 1
                 elif ch == "2":
                     st.selected = 2
@@ -232,10 +231,37 @@ def main():
                 elif ch == "a":
                     stop_all()
                 elif ch == "r":
-                    # invierte signo del seleccionado
+                    # === CORRECCIÓN: SIN try mal cerrado ===
                     if st.selected == 1:
                         m1_sign *= -1
                     elif st.selected == 2:
                         m2_sign *= -1
                     else:
                         m1_sign *= -1
+                        m2_sign *= -1
+                    apply()
+
+        print("\n\n[STOP] Enviando STOP...")
+        stop_all()
+        time.sleep(0.05)
+
+        if DO_INIT and ENABLE_ON:
+            bus.enable(M1_ADDR, False)
+            bus.enable(M2_ADDR, False)
+
+        print(f"[RESULT] Signos finales sugeridos:")
+        print(f"  M1_SIGN = {m1_sign:+d}")
+        print(f"  M2_SIGN = {m2_sign:+d}")
+
+    finally:
+        # STOP por seguridad aunque haya excepción
+        try:
+            bus.stop(M1_ADDR, acc=max(1, min(255, F6_ACC)))
+            bus.stop(M2_ADDR, acc=max(1, min(255, F6_ACC)))
+            time.sleep(0.05)
+        except Exception:
+            pass
+        bus.close()
+
+if __name__ == "__main__":
+    main()
