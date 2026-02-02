@@ -1,7 +1,7 @@
 import time
 import serial
 
-PORT = "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_XXXX-if00-port0"  # <-- cambia esto
+PORT = "ttyUSB0"  # <-- cambia esto
 BAUDRATE = 38400
 
 ADDRS = [0x01, 0x02]
