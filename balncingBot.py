@@ -23,7 +23,7 @@ MOTOR2_ADDR = 0x02
 # Si un motor gira al revés, cambia su SIGN a -1
 # (esto invierte el signo de la consigna "rpm_cmd" hacia ese motor)
 MOTOR1_SIGN = +1
-MOTOR2_SIGN = +1
+MOTOR2_SIGN = -1
 
 # --- Control ---
 CONTROL_HZ = 100.0           # frecuencia del lazo
