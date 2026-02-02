@@ -10,7 +10,7 @@ TIMEOUT = 0.2
 ADDR1 = 0x01
 ADDR2 = 0x02
 
-RPM_TEST = 100
+RPM_TEST = 10
 ACC = 10      # aceleración F6 (0..255)
 RUN_TIME = 5  # segundos
 # ==========================================
