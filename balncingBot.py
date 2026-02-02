@@ -2,73 +2,74 @@
 import time
 import serial
 
-PORT = "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_BG01MQCG-if00-port0"
+# ================= CONFIG =================
+PORT = "/dev/ttyUSB0"
 BAUD = 38400
+TIMEOUT = 0.2
 
 ADDR1 = 0x01
 ADDR2 = 0x02
-RPM = 10
-ACC = 10
 
-def checksum8(b: bytes) -> int:
-    return sum(b) & 0xFF
+RPM_TEST = 100
+ACC = 10      # aceleración F6 (0..255)
+RUN_TIME = 5  # segundos
+# ==========================================
 
-def frame(addr: int, cmd: int, payload: bytes=b"") -> bytes:
+def checksum8(data: bytes) -> int:
+    return sum(data) & 0xFF
+
+def frame(addr: int, cmd: int, payload: bytes = b"") -> bytes:
     base = bytes([0xFA, addr & 0xFF, cmd & 0xFF]) + payload
     return base + bytes([checksum8(base)])
 
 def cmd_set_mode(addr: int) -> bytes:
+    # 82H = set work mode, 05H = SR_vFOC
     return frame(addr, 0x82, bytes([0x05]))
 
 def cmd_enable(addr: int, en: bool) -> bytes:
+    # F3H enable: 01 = enable, 00 = disable
     return frame(addr, 0xF3, bytes([0x01 if en else 0x00]))
 
-def cmd_speed(addr: int, rpm_signed: int, acc: int) -> bytes:
-    rpm = int(rpm_signed)
+def cmd_speed(addr: int, rpm: int, acc: int) -> bytes:
+    # F6H speed command
     dir_bit = 1 if rpm < 0 else 0
     speed = abs(rpm)
     if speed > 3000:
         speed = 3000
-    acc = max(0, min(255, int(acc)))
+
     b4 = ((dir_bit & 1) << 7) | ((speed >> 8) & 0x0F)
     b5 = speed & 0xFF
-    return frame(addr, 0xF6, bytes([b4, b5, acc]))
+    return frame(addr, 0xF6, bytes([b4, b5, acc & 0xFF]))
 
 def stop(addr: int) -> bytes:
     return cmd_speed(addr, 0, ACC)
 
-def tx(ser: serial.Serial, b: bytes, tag: str):
-    n = ser.write(b)
-    ser.flush()
-    print(f"{tag}: wrote {n} bytes (len={len(b)})")
-    return n
+# ================= MAIN =================
+with serial.Serial(PORT, BAUD, timeout=TIMEOUT) as ser:
+    print("Inicializando motores...")
 
-def main():
-    print(f"Abriendo {PORT} @ {BAUD} ...")
-    with serial.Serial(PORT, BAUD, timeout=0, write_timeout=0.5) as ser:
-        # Init
-        tx(ser, cmd_set_mode(ADDR1), "set_mode M1"); time.sleep(0.05)
-        tx(ser, cmd_set_mode(ADDR2), "set_mode M2"); time.sleep(0.05)
-        tx(ser, cmd_enable(ADDR1, True), "enable  M1"); time.sleep(0.05)
-        tx(ser, cmd_enable(ADDR2, True), "enable  M2"); time.sleep(0.05)
+    # Modo SR_vFOC
+    ser.write(cmd_set_mode(ADDR1)); ser.flush(); time.sleep(0.05)
+    ser.write(cmd_set_mode(ADDR2)); ser.flush(); time.sleep(0.05)
 
-        print("Mandando 100rpm en bucle (Ctrl+C para parar). Debe parpadear LED TX.")
-        try:
-            while True:
-                tx(ser, cmd_speed(ADDR1, RPM, ACC), "F6 M1")
-                time.sleep(0.01)
-                tx(ser, cmd_speed(ADDR2, RPM, ACC), "F6 M2")
-                time.sleep(0.20)
-        except KeyboardInterrupt:
-            print("\nSTOP...")
-            tx(ser, stop(ADDR1), "stop M1"); time.sleep(0.05)
-            tx(ser, stop(ADDR2), "stop M2"); time.sleep(0.05)
-            tx(ser, cmd_enable(ADDR1, False), "disable M1"); time.sleep(0.05)
-            tx(ser, cmd_enable(ADDR2, False), "disable M2"); time.sleep(0.05)
-            print("Fin.")
+    # Enable
+    ser.write(cmd_enable(ADDR1, True)); ser.flush(); time.sleep(0.05)
+    ser.write(cmd_enable(ADDR2, True)); ser.flush(); time.sleep(0.05)
 
-if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        print("EXCEPCIÓN:", repr(e))
+    print(f"Motores a {RPM_TEST} rpm...")
+    ser.write(cmd_speed(ADDR1, RPM_TEST, ACC)); ser.flush()
+    ser.write(cmd_speed(ADDR2, RPM_TEST, ACC)); ser.flush()
+
+    time.sleep(RUN_TIME)
+
+    print("STOP")
+    ser.write(stop(ADDR1)); ser.flush()
+    ser.write(stop(ADDR2)); ser.flush()
+
+    time.sleep(0.2)
+
+    # Disable (opcional)
+    ser.write(cmd_enable(ADDR1, False)); ser.flush()
+    ser.write(cmd_enable(ADDR2, False)); ser.flush()
+
+print("Fin.")
