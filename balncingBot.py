@@ -4,8 +4,7 @@ import time
 PORT = "/dev/ttyUSB0"
 BAUDRATE = 38400
 ADDR = 0x01
-ACC = 2          # aceleración
-RPM = 100         # velocidad objetivo
+ACC = 2
 
 
 def checksum8(payload: bytes) -> int:
@@ -17,7 +16,7 @@ def send(ser: serial.Serial, payload: bytes):
     ser.write(frame)
     ser.flush()
     print("TX:", " ".join(f"{b:02X}" for b in frame))
-    time.sleep(0.05)   # pausa conservadora
+    time.sleep(0.05)   # pausa conservadora entre tramas
 
 
 def frame_enable(addr: int) -> bytes:
@@ -26,7 +25,6 @@ def frame_enable(addr: int) -> bytes:
 
 
 def frame_f6_speed(addr: int, rpm: int, acc: int) -> bytes:
-    # Dirección + magnitud
     if rpm < 0:
         direction = 1
         speed = -rpm
@@ -57,10 +55,15 @@ def main():
     try:
         # ENABLE
         send(ser, frame_enable(ADDR))
-        time.sleep(0.1)
 
         # 10 RPM
-        send(ser, frame_f6_speed(ADDR, RPM, ACC))
+        send(ser, frame_f6_speed(ADDR, 10, ACC))
+
+        # Espera 5 segundos
+        time.sleep(5.0)
+
+        # 100 RPM
+        send(ser, frame_f6_speed(ADDR, 100, ACC))
 
     finally:
         ser.close()
