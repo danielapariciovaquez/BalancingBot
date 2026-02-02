@@ -1,69 +1,53 @@
-import serial, time
+import time
+import serial
 
-PORT="/dev/ttyUSB0"
-BAUD=38400
-ADDR=0x01
-ACC=2
-INTER=0.03
+PORT = "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_XXXX-if00-port0"  # <-- cambia esto
+BAUDRATE = 38400
 
-def checksum8(p): return sum(p) & 0xFF
+ADDRS = [0x01, 0x02]
+ACC = 2
+RPM_RUN = 100
+T_RUN = 5.0
+T_STOP = 5.0
 
-def send(ser, payload: bytes, rx_len=32):
-    frm = payload + bytes([checksum8(payload)])
-    try:
-        ser.reset_input_buffer()
-    except Exception:
-        pass
-    ser.write(frm)
-    ser.flush()
-    time.sleep(INTER)
-    rx = ser.read(rx_len)
-    print("TX:", " ".join(f"{b:02X}" for b in frm))
-    print("RX:", " ".join(f"{b:02X}" for b in rx) if rx else "(vacio)")
-    return rx
+def checksum8(p: bytes) -> int:
+    return sum(p) & 0xFF
 
-def f3(enable: bool):
-    return bytes([0xFA, ADDR, 0xF3, 0x01 if enable else 0x00])
+def frame_f3(addr: int, en: bool) -> bytes:
+    p = bytes([0xFA, addr, 0xF3, 0x01 if en else 0x00])
+    return p + bytes([checksum8(p)])
 
-def f6(rpm: int):
-    rpm = int(rpm)
+def frame_f6(addr: int, rpm: int, acc: int) -> bytes:
     if rpm < 0:
         direction = 1
         speed = -rpm
     else:
         direction = 0
         speed = rpm
-    speed = max(0, min(3000, speed))
+    speed = max(0, min(3000, int(speed)))
     b4 = ((direction & 1) << 7) | ((speed >> 8) & 0x0F)
     b5 = speed & 0xFF
-    return bytes([0xFA, ADDR, 0xF6, b4, b5, ACC])
+    p = bytes([0xFA, addr, 0xF6, b4, b5, acc & 0xFF])
+    return p + bytes([checksum8(p)])
 
-ser = serial.Serial(PORT, BAUD, timeout=0.2, write_timeout=0.2)
+def send(ser: serial.Serial, fr: bytes):
+    ser.write(fr)
+    ser.flush()
+    time.sleep(0.02)  # 20 ms
 
-try:
+with serial.Serial(PORT, BAUDRATE, timeout=0.2, write_timeout=0.2) as ser:
+    # Enable una vez
+    for a in ADDRS:
+        send(ser, frame_f3(a, True))
+    time.sleep(0.2)
+
     while True:
-        print("\n== ENABLE + RUN ==")
-        send(ser, f3(True))
-        time.sleep(0.1)
-        send(ser, f6(100))
+        # RUN
+        for a in ADDRS:
+            send(ser, frame_f6(a, RPM_RUN, ACC))
+        time.sleep(T_RUN)
 
-        time.sleep(2)
-
-        print("\n== STOP ==")
-        send(ser, f6(0))
-
-        time.sleep(2)
-
-        print("\n== RE-ENABLE + RUN ==")
-        send(ser, f3(True))
-        time.sleep(0.1)
-        send(ser, f6(100))
-
-        time.sleep(2)
-
-except KeyboardInterrupt:
-    print("\n== SALIR: STOP + DISABLE ==")
-    send(ser, f6(0))
-    send(ser, f3(False))
-finally:
-    ser.close()
+        # STOP
+        for a in ADDRS:
+            send(ser, frame_f6(a, 0, ACC))
+        time.sleep(T_STOP)
