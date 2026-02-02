@@ -8,7 +8,7 @@ ADDR_M1 = 0x01
 ADDR_M2 = 0x02
 
 ACC = 255          # aceleración
-RPM_RUN = 100    # rpm objetivo
+RPM_RUN = 10    # rpm objetivo
 T_RUN = 5.0      # segundos en marcha
 T_STOP = 5.0     # segundos parado
 
