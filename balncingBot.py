@@ -5,7 +5,7 @@ PORT = "/dev/ttyUSB0"
 BAUDRATE = 38400
 ADDR = 0x01
 ACC = 2          # aceleración
-RPM = 10         # velocidad objetivo
+RPM = 100         # velocidad objetivo
 
 
 def checksum8(payload: bytes) -> int:
