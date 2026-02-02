@@ -9,7 +9,8 @@ from mpu6050 import mpu6050
 # RS485
 PORT = "/dev/ttyUSB0"
 BAUD = 38400
-TIMEOUT = 0.2
+TIMEOUT = 0.05
+
 ADDR1 = 0x01
 ADDR2 = 0x02
 
@@ -18,17 +19,23 @@ M1_SIGN = -1
 M2_SIGN = +1
 
 # F6 (speed)
-ACC = 20           # 0..255
-MAX_RPM = 250      # límite por seguridad
+ACC = 20              # 0..255
+MAX_RPM = 250         # límite por seguridad
 
 # Control proporcional
-LOOP_HZ = 100.0
+LOOP_HZ = 50.0        # <<< BAJAMOS a 50 Hz para estabilidad RS485
 CALIB_SECONDS = 1.0
-K_RPM_PER_DEG = 20.0   # rpm por grado (ajusta)
-DEADZONE_DEG = 0.8     # grados, evita moverse por ruido
+K_RPM_PER_DEG = 20.0  # rpm por grado
+DEADZONE_DEG = 0.8
 
-# Suavizado (opcional)
-PITCH_ALPHA = 0.15     # 0..1, filtro IIR (más bajo = más suave)
+# Suavizado de pitch
+PITCH_ALPHA = 0.15    # 0..1
+
+# Inter-frame gap (muy importante en RS485)
+INTER_FRAME_DELAY_S = 0.002  # 2 ms entre tramas
+
+# Re-Enable periódico (opcional pero útil)
+REENABLE_EVERY_S = 1.0
 
 # IMU
 IMU_ADDR = 0x68
@@ -61,9 +68,6 @@ def cmd_speed(addr: int, rpm_signed: int, acc: int) -> bytes:
     b5 = speed & 0xFF
     return frame(addr, 0xF6, bytes([b4, b5, acc]))
 
-def cmd_stop(addr: int) -> bytes:
-    return cmd_speed(addr, 0, ACC)
-
 def accel_to_pitch_deg(ax: float, ay: float, az: float) -> float:
     # pitch = atan2(-Ax, sqrt(Ay^2 + Az^2))
     pitch = math.atan2(-ax, math.sqrt(ay * ay + az * az))
@@ -83,24 +87,28 @@ def main():
 
     imu = mpu6050(IMU_ADDR)
 
-    with serial.Serial(PORT, BAUD, timeout=TIMEOUT) as ser:
-        def write_cmd(b: bytes):
+    # Importante: write_timeout evita bloqueos si el adaptador se atasca
+    with serial.Serial(PORT, BAUD, timeout=TIMEOUT, write_timeout=0.2) as ser:
+
+        def tx(b: bytes):
             ser.write(b)
-            ser.flush()
+
+        def tx_gap(b: bytes):
+            ser.write(b)
+            time.sleep(INTER_FRAME_DELAY_S)
 
         def safe_stop():
-            # STOP + disable
-            write_cmd(cmd_stop(ADDR1))
-            write_cmd(cmd_stop(ADDR2))
-            time.sleep(0.05)
-            write_cmd(cmd_enable(ADDR1, False))
-            write_cmd(cmd_enable(ADDR2, False))
+            # STOP + disable (con gaps)
+            tx_gap(cmd_speed(ADDR1, 0, ACC))
+            tx_gap(cmd_speed(ADDR2, 0, ACC))
+            tx_gap(cmd_enable(ADDR1, False))
+            tx_gap(cmd_enable(ADDR2, False))
 
         # ---------- Init motores ----------
-        write_cmd(cmd_set_mode(ADDR1)); time.sleep(0.05)
-        write_cmd(cmd_set_mode(ADDR2)); time.sleep(0.05)
-        write_cmd(cmd_enable(ADDR1, True)); time.sleep(0.05)
-        write_cmd(cmd_enable(ADDR2, True)); time.sleep(0.05)
+        tx_gap(cmd_set_mode(ADDR1))
+        tx_gap(cmd_set_mode(ADDR2))
+        tx_gap(cmd_enable(ADDR1, True))
+        tx_gap(cmd_enable(ADDR2, True))
 
         # ---------- Calibración pitch0 ----------
         t_end = time.monotonic() + max(0.2, CALIB_SECONDS)
@@ -121,16 +129,18 @@ def main():
 
         pitch0 = p0_sum / n
         print(f"[CAL] pitch0 = {pitch0:+.3f} deg  (N={n})")
-        print(f"[CFG] M1_SIGN={M1_SIGN:+d}  M2_SIGN={M2_SIGN:+d}  K={K_RPM_PER_DEG:.2f} rpm/deg  deadzone={DEADZONE_DEG:.2f}°  MAX_RPM={MAX_RPM}")
+        print(f"[CFG] LOOP_HZ={LOOP_HZ:.1f}  K={K_RPM_PER_DEG:.2f} rpm/deg  deadzone={DEADZONE_DEG:.2f}°  MAX_RPM={MAX_RPM}")
+        print(f"[CFG] M1_SIGN={M1_SIGN:+d} (invertido)  M2_SIGN={M2_SIGN:+d}")
         print("[RUN] Inclinación -> velocidad. Ctrl+C para salir (STOP).")
 
-        # ---------- Loop ----------
         dt = 1.0 / LOOP_HZ
         next_t = time.monotonic()
 
         pitch_f = 0.0
         log_next = time.monotonic()
-        log_dt = 1.0 / 20.0  # 20 Hz log
+        log_dt = 1.0 / 20.0  # log a 20 Hz
+
+        last_enable = time.monotonic()
 
         try:
             while not stop_flag["stop"]:
@@ -146,10 +156,8 @@ def main():
                 az = float(a.get("z", 0.0))
 
                 pitch = accel_to_pitch_deg(ax, ay, az) - pitch0
-                # filtro IIR
                 pitch_f = pitch_f + PITCH_ALPHA * (pitch - pitch_f)
 
-                # deadzone
                 if abs(pitch_f) < DEADZONE_DEG:
                     rpm_cmd = 0.0
                 else:
@@ -158,16 +166,23 @@ def main():
                 rpm_cmd = clamp(rpm_cmd, -MAX_RPM, MAX_RPM)
                 rpm_int = int(round(rpm_cmd))
 
-                # aplicar signos
                 m1 = M1_SIGN * rpm_int
                 m2 = M2_SIGN * rpm_int
 
-                write_cmd(cmd_speed(ADDR1, m1, ACC))
-                write_cmd(cmd_speed(ADDR2, m2, ACC))
+                # Envío con gap entre tramas (clave)
+                tx_gap(cmd_speed(ADDR1, m1, ACC))
+                tx_gap(cmd_speed(ADDR2, m2, ACC))
+
+                # Re-enable periódico (por si el driver entra/sale de algún estado)
+                if (now - last_enable) >= REENABLE_EVERY_S:
+                    last_enable = now
+                    tx_gap(cmd_enable(ADDR1, True))
+                    tx_gap(cmd_enable(ADDR2, True))
 
                 if now >= log_next:
                     log_next += log_dt
-                    print(f"\rpitch={pitch_f:+7.2f}°  rpm={rpm_int:+5d} | m1={m1:+5d}  m2={m2:+5d}    ", end="", flush=True)
+                    print(f"\rpitch={pitch_f:+7.2f}°  rpm={rpm_int:+5d} | m1={m1:+5d}  m2={m2:+5d}    ",
+                          end="", flush=True)
 
         finally:
             print("\n[STOP] Parando motores...")
