@@ -7,7 +7,7 @@ BAUD = 38400
 
 ADDR1 = 0x01
 ADDR2 = 0x02
-RPM = 100
+RPM = 10
 ACC = 10
 
 def checksum8(b: bytes) -> int:
