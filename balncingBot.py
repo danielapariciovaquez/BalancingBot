@@ -1,19 +1,38 @@
 #!/usr/bin/env python3
 import time
+import math
+import signal
 import serial
+from mpu6050 import mpu6050
 
-# ================= CONFIG =================
+# ===================== CONFIG =====================
+# RS485
 PORT = "/dev/ttyUSB0"
 BAUD = 38400
 TIMEOUT = 0.2
-
 ADDR1 = 0x01
 ADDR2 = 0x02
 
-RPM_TEST = 10
-ACC = 10      # aceleración F6 (0..255)
-RUN_TIME = 5  # segundos
-# ==========================================
+# Motor 1 invertido (según tu prueba)
+M1_SIGN = -1
+M2_SIGN = +1
+
+# F6 (speed)
+ACC = 20           # 0..255
+MAX_RPM = 250      # límite por seguridad
+
+# Control proporcional
+LOOP_HZ = 100.0
+CALIB_SECONDS = 1.0
+K_RPM_PER_DEG = 20.0   # rpm por grado (ajusta)
+DEADZONE_DEG = 0.8     # grados, evita moverse por ruido
+
+# Suavizado (opcional)
+PITCH_ALPHA = 0.15     # 0..1, filtro IIR (más bajo = más suave)
+
+# IMU
+IMU_ADDR = 0x68
+# ==================================================
 
 def checksum8(data: bytes) -> int:
     return sum(data) & 0xFF
@@ -23,53 +42,137 @@ def frame(addr: int, cmd: int, payload: bytes = b"") -> bytes:
     return base + bytes([checksum8(base)])
 
 def cmd_set_mode(addr: int) -> bytes:
-    # 82H = set work mode, 05H = SR_vFOC
+    # 82H set work mode, 05H = SR_vFOC
     return frame(addr, 0x82, bytes([0x05]))
 
 def cmd_enable(addr: int, en: bool) -> bytes:
     # F3H enable: 01 = enable, 00 = disable
     return frame(addr, 0xF3, bytes([0x01 if en else 0x00]))
 
-def cmd_speed(addr: int, rpm: int, acc: int) -> bytes:
+def cmd_speed(addr: int, rpm_signed: int, acc: int) -> bytes:
     # F6H speed command
+    rpm = int(rpm_signed)
     dir_bit = 1 if rpm < 0 else 0
     speed = abs(rpm)
     if speed > 3000:
         speed = 3000
-
+    acc = max(0, min(255, int(acc)))
     b4 = ((dir_bit & 1) << 7) | ((speed >> 8) & 0x0F)
     b5 = speed & 0xFF
-    return frame(addr, 0xF6, bytes([b4, b5, acc & 0xFF]))
+    return frame(addr, 0xF6, bytes([b4, b5, acc]))
 
-def stop(addr: int) -> bytes:
+def cmd_stop(addr: int) -> bytes:
     return cmd_speed(addr, 0, ACC)
 
-# ================= MAIN =================
-with serial.Serial(PORT, BAUD, timeout=TIMEOUT) as ser:
-    print("Inicializando motores...")
+def accel_to_pitch_deg(ax: float, ay: float, az: float) -> float:
+    # pitch = atan2(-Ax, sqrt(Ay^2 + Az^2))
+    pitch = math.atan2(-ax, math.sqrt(ay * ay + az * az))
+    return pitch * 180.0 / math.pi
 
-    # Modo SR_vFOC
-    ser.write(cmd_set_mode(ADDR1)); ser.flush(); time.sleep(0.05)
-    ser.write(cmd_set_mode(ADDR2)); ser.flush(); time.sleep(0.05)
+def clamp(x: float, lo: float, hi: float) -> float:
+    return lo if x < lo else hi if x > hi else x
 
-    # Enable
-    ser.write(cmd_enable(ADDR1, True)); ser.flush(); time.sleep(0.05)
-    ser.write(cmd_enable(ADDR2, True)); ser.flush(); time.sleep(0.05)
+def main():
+    stop_flag = {"stop": False}
 
-    print(f"Motores a {RPM_TEST} rpm...")
-    ser.write(cmd_speed(ADDR1, RPM_TEST, ACC)); ser.flush()
-    ser.write(cmd_speed(ADDR2, -RPM_TEST, ACC)); ser.flush()
+    def on_sig(_sig, _frame):
+        stop_flag["stop"] = True
 
-    time.sleep(RUN_TIME)
+    signal.signal(signal.SIGINT, on_sig)
+    signal.signal(signal.SIGTERM, on_sig)
 
-    print("STOP")
-    ser.write(stop(ADDR1)); ser.flush()
-    ser.write(stop(ADDR2)); ser.flush()
+    imu = mpu6050(IMU_ADDR)
 
-    time.sleep(0.2)
+    with serial.Serial(PORT, BAUD, timeout=TIMEOUT) as ser:
+        def write_cmd(b: bytes):
+            ser.write(b)
+            ser.flush()
 
-    # Disable (opcional)
-    ser.write(cmd_enable(ADDR1, False)); ser.flush()
-    ser.write(cmd_enable(ADDR2, False)); ser.flush()
+        def safe_stop():
+            # STOP + disable
+            write_cmd(cmd_stop(ADDR1))
+            write_cmd(cmd_stop(ADDR2))
+            time.sleep(0.05)
+            write_cmd(cmd_enable(ADDR1, False))
+            write_cmd(cmd_enable(ADDR2, False))
 
-print("Fin.")
+        # ---------- Init motores ----------
+        write_cmd(cmd_set_mode(ADDR1)); time.sleep(0.05)
+        write_cmd(cmd_set_mode(ADDR2)); time.sleep(0.05)
+        write_cmd(cmd_enable(ADDR1, True)); time.sleep(0.05)
+        write_cmd(cmd_enable(ADDR2, True)); time.sleep(0.05)
+
+        # ---------- Calibración pitch0 ----------
+        t_end = time.monotonic() + max(0.2, CALIB_SECONDS)
+        n = 0
+        p0_sum = 0.0
+        while time.monotonic() < t_end:
+            a = imu.get_accel_data()
+            ax = float(a.get("x", 0.0))
+            ay = float(a.get("y", 0.0))
+            az = float(a.get("z", 0.0))
+            p0_sum += accel_to_pitch_deg(ax, ay, az)
+            n += 1
+            time.sleep(0.005)
+
+        if n == 0:
+            safe_stop()
+            raise RuntimeError("Calibración fallida (0 muestras).")
+
+        pitch0 = p0_sum / n
+        print(f"[CAL] pitch0 = {pitch0:+.3f} deg  (N={n})")
+        print(f"[CFG] M1_SIGN={M1_SIGN:+d}  M2_SIGN={M2_SIGN:+d}  K={K_RPM_PER_DEG:.2f} rpm/deg  deadzone={DEADZONE_DEG:.2f}°  MAX_RPM={MAX_RPM}")
+        print("[RUN] Inclinación -> velocidad. Ctrl+C para salir (STOP).")
+
+        # ---------- Loop ----------
+        dt = 1.0 / LOOP_HZ
+        next_t = time.monotonic()
+
+        pitch_f = 0.0
+        log_next = time.monotonic()
+        log_dt = 1.0 / 20.0  # 20 Hz log
+
+        try:
+            while not stop_flag["stop"]:
+                now = time.monotonic()
+                if now < next_t:
+                    time.sleep(next_t - now)
+                    continue
+                next_t += dt
+
+                a = imu.get_accel_data()
+                ax = float(a.get("x", 0.0))
+                ay = float(a.get("y", 0.0))
+                az = float(a.get("z", 0.0))
+
+                pitch = accel_to_pitch_deg(ax, ay, az) - pitch0
+                # filtro IIR
+                pitch_f = pitch_f + PITCH_ALPHA * (pitch - pitch_f)
+
+                # deadzone
+                if abs(pitch_f) < DEADZONE_DEG:
+                    rpm_cmd = 0.0
+                else:
+                    rpm_cmd = K_RPM_PER_DEG * pitch_f
+
+                rpm_cmd = clamp(rpm_cmd, -MAX_RPM, MAX_RPM)
+                rpm_int = int(round(rpm_cmd))
+
+                # aplicar signos
+                m1 = M1_SIGN * rpm_int
+                m2 = M2_SIGN * rpm_int
+
+                write_cmd(cmd_speed(ADDR1, m1, ACC))
+                write_cmd(cmd_speed(ADDR2, m2, ACC))
+
+                if now >= log_next:
+                    log_next += log_dt
+                    print(f"\rpitch={pitch_f:+7.2f}°  rpm={rpm_int:+5d} | m1={m1:+5d}  m2={m2:+5d}    ", end="", flush=True)
+
+        finally:
+            print("\n[STOP] Parando motores...")
+            safe_stop()
+            print("[STOP] Hecho.")
+
+if __name__ == "__main__":
+    main()
