@@ -1,18 +1,23 @@
-import serial
 import time
+import serial
+
+try:
+    from serial.rs485 import RS485Settings
+except Exception:
+    RS485Settings = None  # si no está disponible, seguiremos sin ello
 
 PORT = "/dev/ttyUSB0"
 BAUDRATE = 38400
 
-ADDRS = [0x01, 0x02]   # motor 1 y motor 2
+ADDRS = [0x01, 0x02]
 ACC = 2
 
 RPM_RUN = 100
 T_RUN = 5.0
 T_STOP = 5.0
 
-INTER_FRAME_DELAY = 0.02   # 20 ms entre tramas (clave)
-STOP_RETRIES = 3           # repetir STOP para asegurar
+INTER_FRAME_DELAY = 0.08   # 80 ms (conservador)
+STOP_RETRIES = 3
 
 
 def checksum8(payload: bytes) -> int:
@@ -48,8 +53,8 @@ def hx(b: bytes) -> str:
     return " ".join(f"{x:02X}" for x in b)
 
 
-def send(ser: serial.Serial, frame: bytes, label: str = ""):
-    # drenar RX por si el adaptador acumula basura/eco (no dependemos de RX)
+def send(ser: serial.Serial, frame: bytes, tag: str = ""):
+    # Drenar RX por si hay eco/basura
     try:
         ser.reset_input_buffer()
     except Exception:
@@ -58,8 +63,8 @@ def send(ser: serial.Serial, frame: bytes, label: str = ""):
     ser.write(frame)
     ser.flush()
 
-    if label:
-        print(f"{label} TX: {hx(frame)}")
+    if tag:
+        print(f"{tag} TX: {hx(frame)}")
     else:
         print(f"TX: {hx(frame)}")
 
@@ -77,35 +82,59 @@ def main():
         write_timeout=0.2,
     )
 
+    # Fuerza modo RS485 con RTS->DE si pyserial lo soporta
+    # (esto soluciona muchos “solo llega la primera trama”)
+    if RS485Settings is not None:
+        try:
+            ser.rs485_mode = RS485Settings(
+                rts_level_for_tx=True,
+                rts_level_for_rx=False,
+                delay_before_tx=0.001,
+                delay_before_rx=0.001,
+            )
+            print("[INFO] RS485Settings activado (RTS controla DE).")
+        except Exception as e:
+            print(f"[WARN] No se pudo activar RS485Settings: {e}")
+
     try:
-        # Enable motores
+        print("[INFO] ENABLE motores")
         for a in ADDRS:
-            send(ser, frame_f3_enable(a, True), label=f"EN[{a:02X}]")
+            send(ser, frame_f3_enable(a, True), tag=f"EN[{a:02X}]")
         time.sleep(0.2)
 
-        print("Bucle: RUN 5s / STOP 5s (indefinido)")
+        print("[INFO] Bucle: RUN 5s / STOP+DISABLE 5s")
 
         while True:
             # RUN
             print("== RUN ==")
             for a in ADDRS:
-                send(ser, frame_f6_speed(a, RPM_RUN, ACC), label=f"F6[{a:02X}]")
+                send(ser, frame_f6_speed(a, RPM_RUN, ACC), tag=f"F6[{a:02X}]")
             time.sleep(T_RUN)
 
-            # STOP (repetido)
+            # STOP + DISABLE
             print("== STOP ==")
             for _ in range(STOP_RETRIES):
                 for a in ADDRS:
-                    send(ser, frame_f6_speed(a, 0, ACC), label=f"F6STOP[{a:02X}]")
+                    send(ser, frame_f6_speed(a, 0, ACC), tag=f"F6STOP[{a:02X}]")
+
+            # Corta el driver (más contundente que 0 RPM)
+            for a in ADDRS:
+                send(ser, frame_f3_enable(a, False), tag=f"DIS[{a:02X}]")
+
             time.sleep(T_STOP)
 
+            # Re-enable para el siguiente RUN
+            for a in ADDRS:
+                send(ser, frame_f3_enable(a, True), tag=f"EN[{a:02X}]")
+            time.sleep(0.05)
+
     except KeyboardInterrupt:
-        print("\nCTRL+C -> STOP y salir")
+        print("\n[INFO] CTRL+C -> STOP y salir")
         for _ in range(STOP_RETRIES):
             for a in ADDRS:
-                send(ser, frame_f6_speed(a, 0, ACC), label=f"F6STOP[{a:02X}]")
+                send(ser, frame_f6_speed(a, 0, ACC), tag=f"F6STOP[{a:02X}]")
         for a in ADDRS:
-            send(ser, frame_f3_enable(a, False), label=f"DIS[{a:02X}]")
+            send(ser, frame_f3_enable(a, False), tag=f"DIS[{a:02X}]")
 
     finally:
         ser.close()
