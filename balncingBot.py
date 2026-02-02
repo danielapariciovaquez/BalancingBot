@@ -12,7 +12,7 @@ TIMEOUT_S = 0.2
 ADDRS = [0x01, 0x02]  # tus dos motores
 
 # Prueba de movimiento
-TEST_RPM = 00
+TEST_RPM = 10
 TEST_ACC = 2
 RUN_SECONDS = 2.0
 
