@@ -1,137 +1,237 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 import time
+import math
+import signal
+import threading
+from dataclasses import dataclass
+
 import serial
+from mpu6050 import mpu6050
 
-# ================= CONFIG =================
-PORT = "/dev/ttyUSB0"
-BAUD = 38400
-ADDR = 0x01
+# ============================================================
+# CONFIG (TOCAR AQUÍ)
+# ============================================================
 
-RPM_RUN = 10        # 0..3000
-ACC_RUN = 2         # 0..255
+# ---- RS485 ----
+RS485_PORT = "/dev/ttyUSB0"
+RS485_BAUD = 38400
+RS485_TIMEOUT_S = 0.05
+INTER_FRAME_DELAY_S = 0.002  # deja esto: evita tramas pegadas
 
-WAIT_AFTER_RUN = 0.5
-TIMEOUT_SERIAL = 0.05     # timeout corto; nosotros hacemos “polling” por ventana
-T_PRE_READ = 0.03         # 30 ms para que el adaptador auto-direction pase a RX
-T_WINDOW = 0.5            # ventana de captura de respuestas tras cada TX
-# =========================================
+MOTOR1_ADDR = 0x01
+MOTOR2_ADDR = 0x02
 
+# Signos por motor (ajuste de sentido)
+M1_SIGN = +1
+M2_SIGN = -1
 
-def checksum8(data: bytes) -> int:
-    return sum(data) & 0xFF
+# ---- Enable ----
+ENABLE_ON_START = True   # manda F3=01 al inicio
 
+# ---- Speed command (F6) ----
+F6_ACC = 20        # 0..255
+MAX_RPM = 250      # límite duro de seguridad
 
-def frame(addr: int, code: int, payload: bytes = b"") -> bytes:
-    base = bytes([0xFA, addr & 0xFF, code & 0xFF]) + payload
+# ---- Control (proporcional a inclinación) ----
+LOOP_HZ = 100.0
+CALIB_SECONDS = 1.0
+K_RPM_PER_DEG = 20.0     # rpm por grado
+DEADZONE_DEG = 0.8
+PITCH_LP_ALPHA = 0.15    # filtro 0..1
+MAX_STEP_RPM_PER_CYCLE = 40
+
+# ---- IMU ----
+IMU_I2C_ADDR = 0x68
+
+# ============================================================
+# PROTOCOLO MKS RS485
+# Downlink: FA addr code ... CRC, CRC = sum(bytes) & 0xFF
+# ============================================================
+
+def checksum8(payload: bytes) -> int:
+    return sum(payload) & 0xFF
+
+def build_frame(addr: int, code: int, data: bytes = b"") -> bytes:
+    base = bytes([0xFA, addr & 0xFF, code & 0xFF]) + data
     return base + bytes([checksum8(base)])
 
+def encode_f6_speed(rpm_signed: int, acc: int) -> bytes:
+    rpm = int(rpm_signed)
+    dir_bit = 1 if rpm < 0 else 0
+    speed = abs(rpm)
 
-def build_f6_speed(addr: int, rpm: int, acc: int, cw: bool = True) -> bytes:
-    """
-    Speed mode (F6): Byte4..Byte5 codifican dirección + velocidad.
-    Manual: bit más alto indica dirección. Rango velocidad 0..3000. :contentReference[oaicite:3]{index=3}
-    Usamos un word: bit15=dir, bits0..14=rpm.
-    """
-    if not (0 <= rpm <= 3000):
-        raise ValueError("RPM fuera de rango (0..3000)")
-    if not (0 <= acc <= 255):
-        raise ValueError("ACC fuera de rango (0..255)")
+    if speed > 3000:
+        speed = 3000
+    acc = max(0, min(255, int(acc)))
 
-    word = rpm & 0x7FFF
-    if not cw:
-        word |= 0x8000  # si quieres invertir
+    b4 = ((dir_bit & 0x01) << 7) | ((speed >> 8) & 0x0F)
+    b5 = speed & 0xFF
+    return bytes([b4, b5, acc])
 
-    b4 = (word >> 8) & 0xFF
-    b5 = word & 0xFF
-    return frame(addr, 0xF6, bytes([b4, b5, acc & 0xFF]))
+def clamp(x: float, lo: float, hi: float) -> float:
+    return lo if x < lo else hi if x > hi else x
 
+def lp(prev: float, x: float, alpha: float) -> float:
+    return prev + alpha * (x - prev)
 
-def read_window_raw(ser: serial.Serial, t_window: float) -> bytes:
-    """Lee bytes durante una ventana de tiempo."""
-    t0 = time.time()
-    buf = b""
-    while (time.time() - t0) < t_window:
-        n = ser.in_waiting
-        if n:
-            buf += ser.read(n)
-        time.sleep(0.005)
-    return buf
+@dataclass
+class MotorSigns:
+    m1: int = +1
+    m2: int = -1
 
+class MksRs485:
+    def __init__(self, port: str, baud: int, timeout_s: float, inter_frame_delay_s: float):
+        self.ser = serial.Serial(
+            port=port,
+            baudrate=baud,
+            bytesize=serial.EIGHTBITS,
+            parity=serial.PARITY_NONE,
+            stopbits=serial.STOPBITS_ONE,
+            timeout=timeout_s,
+        )
+        self.ifd = float(inter_frame_delay_s)
+        self.lock = threading.Lock()
 
-def extract_fb_frames(rx: bytes):
-    """
-    Extrae frames de uplink tipo:
-      FB addr code data CRC  (5 bytes)
-    Muchos ACK del manual son de 5 bytes. 
-    Si llega basura o concatenación, intentamos resincronizar buscando 0xFB.
-    """
-    frames = []
-    i = 0
-    while True:
-        j = rx.find(b"\xFB", i)
-        if j < 0:
-            break
-        if j + 5 <= len(rx):
-            cand = rx[j:j+5]
-            if checksum8(cand[:-1]) == cand[-1]:
-                frames.append(cand)
-                i = j + 5
-            else:
-                # CRC no cuadra: avanza 1 byte para re-sincronizar
-                i = j + 1
-        else:
-            break
-    return frames
+    def close(self):
+        try:
+            self.ser.close()
+        except Exception:
+            pass
 
+    def tx(self, addr: int, code: int, data: bytes = b"", expect_reply: bool = False) -> None:
+        # En esta versión: NO leemos RX (expect_reply=False siempre)
+        frame = build_frame(addr, code, data)
+        with self.lock:
+            self.ser.write(frame)
+            self.ser.flush()
+            time.sleep(self.ifd)
 
-def txrx(ser: serial.Serial, tx: bytes, tag: str,
-         t_pre: float = T_PRE_READ, t_window: float = T_WINDOW):
-    # NO hacemos reset_input_buffer aquí a lo loco: leemos y parseamos.
-    ser.write(tx)
-    ser.flush()
-    print(f"TX {tag}: {tx.hex(' ')}")
+    def enable(self, addr: int, en: bool):
+        # F3H enable: 00 loose / 01 shaft lock
+        self.tx(addr, 0xF3, bytes([0x01 if en else 0x00]), expect_reply=False)
 
-    time.sleep(t_pre)
-    raw = read_window_raw(ser, t_window)
+    def speed_f6(self, addr: int, rpm_signed: int, acc: int):
+        # F6H speed control
+        self.tx(addr, 0xF6, encode_f6_speed(rpm_signed, acc), expect_reply=False)
 
-    if raw:
-        frames = extract_fb_frames(raw)
-        if frames:
-            for k, fr in enumerate(frames):
-                print(f"RX {tag}[{k}]: {fr.hex(' ')}")
-        else:
-            print(f"RX {tag}: bytes no parseados: {raw.hex(' ')}")
-    else:
-        print(f"RX {tag}: <sin respuesta>")
+    def stop_f6(self, addr: int, acc: int):
+        self.speed_f6(addr, 0, acc)
 
-    return raw
-
+def accel_to_pitch_deg(ax: float, ay: float, az: float) -> float:
+    pitch = math.atan2(-ax, math.sqrt(ay * ay + az * az))
+    return pitch * 180.0 / math.pi
 
 def main():
-    with serial.Serial(PORT, BAUD, timeout=TIMEOUT_SERIAL) as ser:
-        ser.reset_input_buffer()
-        ser.reset_output_buffer()
+    stop_flag = {"stop": False}
 
-        # 2) ENABLE: FA 01 F3 01 EF :contentReference[oaicite:7]{index=7}
-        txrx(ser, frame(ADDR, 0xF3, bytes([0x01])), "enable_F3_01")
+    def _sig_handler(_sig, _frame):
+        stop_flag["stop"] = True
 
-        # 3) RUN 10 rpm (F6) :contentReference[oaicite:8]{index=8}
-        txrx(ser, build_f6_speed(ADDR, RPM_RUN, ACC_RUN, cw=True), "run_F6_10rpm")
+    signal.signal(signal.SIGINT, _sig_handler)
+    signal.signal(signal.SIGTERM, _sig_handler)
 
-        time.sleep(WAIT_AFTER_RUN)
+    imu = mpu6050(IMU_I2C_ADDR)
+    bus = MksRs485(RS485_PORT, RS485_BAUD, RS485_TIMEOUT_S, INTER_FRAME_DELAY_S)
+    signs = MotorSigns(m1=M1_SIGN, m2=M2_SIGN)
 
-        # 4) STOP inmediato: F6 speed=0 acc=0  (ejemplo: FA 01 F6 00 00 00 F1) :contentReference[oaicite:9]{index=9}
-        raw_stop = txrx(ser, build_f6_speed(ADDR, 0, 0, cw=True), "stop_F6_acc0")
+    def safe_shutdown():
+        try:
+            bus.stop_f6(MOTOR1_ADDR, acc=max(1, min(255, F6_ACC)))
+            bus.stop_f6(MOTOR2_ADDR, acc=max(1, min(255, F6_ACC)))
+            time.sleep(0.05)
+            bus.enable(MOTOR1_ADDR, False)
+            bus.enable(MOTOR2_ADDR, False)
+        except Exception:
+            pass
+        bus.close()
 
-        # 5) DISABLE: FA 01 F3 00 EE :contentReference[oaicite:10]{index=10}
-        raw_dis = txrx(ser, frame(ADDR, 0xF3, bytes([0x00])), "disable_F3_00")
+    # ---- SOLO enable (sin set_mode ni nada más) ----
+    try:
+        if ENABLE_ON_START:
+            bus.enable(MOTOR1_ADDR, True)
+            bus.enable(MOTOR2_ADDR, True)
+    except Exception as e:
+        safe_shutdown()
+        raise RuntimeError(f"Fallo haciendo enable por RS485: {e}") from e
 
-        # 6) Si no hay respuesta a stop o disable, lanza E-STOP (F7) como salvavidas
-        # Manual: “You can also use emergency stop command F7H”. Ejemplo FA 01 F7 F2 
-        if (not raw_stop) or (not raw_dis):
-            txrx(ser, frame(ADDR, 0xF7, b""), "estop_F7")
+    # ---- Calibración: pitch0 con robot recto ----
+    t_end = time.monotonic() + max(0.2, CALIB_SECONDS)
+    n = 0
+    p0_sum = 0.0
+    while time.monotonic() < t_end:
+        a = imu.get_accel_data()
+        ax = float(a.get("x", 0.0))
+        ay = float(a.get("y", 0.0))
+        az = float(a.get("z", 0.0))
+        p0_sum += accel_to_pitch_deg(ax, ay, az)
+        n += 1
+        time.sleep(0.005)
+    if n == 0:
+        safe_shutdown()
+        raise RuntimeError("Calibración fallida: 0 muestras")
+    pitch0 = p0_sum / n
+
+    print(f"[CAL] pitch0 = {pitch0:+.3f} deg (N={n})")
+    print("[RUN] Inclinación -> velocidad (proporcional). Ctrl+C para parar (0 rpm).")
+    print(f"[CFG] K={K_RPM_PER_DEG:.2f} rpm/deg, deadzone={DEADZONE_DEG:.2f} deg, MAX_RPM={MAX_RPM}, signs=({signs.m1},{signs.m2})")
+
+    # ---- Loop ----
+    dt = 1.0 / LOOP_HZ
+    next_t = time.monotonic()
+    pitch_f = 0.0
+    rpm_prev = 0.0
+
+    log_dt = 1.0 / 20.0
+    log_next = time.monotonic()
+
+    try:
+        while not stop_flag["stop"]:
+            now = time.monotonic()
+            if now < next_t:
+                time.sleep(next_t - now)
+                continue
+            next_t += dt
+
+            a = imu.get_accel_data()
+            ax = float(a.get("x", 0.0))
+            ay = float(a.get("y", 0.0))
+            az = float(a.get("z", 0.0))
+
+            pitch = accel_to_pitch_deg(ax, ay, az) - pitch0
+            pitch_f = lp(pitch_f, pitch, PITCH_LP_ALPHA)
+
+            if abs(pitch_f) < DEADZONE_DEG:
+                rpm_cmd = 0.0
+            else:
+                rpm_cmd = K_RPM_PER_DEG * pitch_f
+
+            rpm_cmd = clamp(rpm_cmd, -MAX_RPM, MAX_RPM)
+
+            # slew limiter por ciclo
+            dr = rpm_cmd - rpm_prev
+            dr = clamp(dr, -MAX_STEP_RPM_PER_CYCLE, MAX_STEP_RPM_PER_CYCLE)
+            rpm_cmd = rpm_prev + dr
+            rpm_prev = rpm_cmd
+
+            rpm_int = int(round(rpm_cmd))
+
+            # Enviar a ambos motores
+            bus.speed_f6(MOTOR1_ADDR, signs.m1 * rpm_int, acc=F6_ACC)
+            bus.speed_f6(MOTOR2_ADDR, signs.m2 * rpm_int, acc=F6_ACC)
+
+            if now >= log_next:
+                log_next += log_dt
+                print(
+                    f"\rpitch={pitch_f:+7.2f} deg  -> rpm={rpm_int:+5d}  |  "
+                    f"m1={signs.m1*rpm_int:+5d}  m2={signs.m2*rpm_int:+5d}     ",
+                    end="",
+                    flush=True,
+                )
+
+    finally:
+        print("\n[STOP] Parando motores...")
+        safe_shutdown()
+        print("[STOP] Hecho.")
 
 if __name__ == "__main__":
     main()
