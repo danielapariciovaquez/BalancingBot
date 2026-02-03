@@ -70,16 +70,14 @@ def main():
         ser.reset_input_buffer()
         ser.reset_output_buffer()
 
+        # 1) Set work mode = SR_vFOC (speed mode) : 0x82 0x05
+        txrx(ser, frame(ADDR, 0x82, bytes([0x05])), "mode_SR_vFOC")
+
         # 2) ENABLE (shaft lock): 0xF3 0x01
         txrx(ser, frame(ADDR, 0xF3, bytes([0x01])), "enable_F3_01")
 
         # 3) RUN 10 rpm (F6): speed_word=0x000A => [0x00,0x0A], acc=ACC_RUN
-        txrx(ser, frame(ADDR, 0xF6, bytes([0x00, 10 & 0xFF, ACC_RUN])), "run_F6_10rpm")
-
-        time.sleep(WAIT_RUN_S)
-
-        txrx(ser, frame(ADDR, 0xF6, bytes([0x00, 10 & 0xFF, ACC_RUN])), "run_F6_10rpm")
-
+        txrx(ser, frame(ADDR, 0xF6, bytes([0x00, 5 & 0xFF, ACC_RUN])), "run_F6_10rpm")
 
         time.sleep(WAIT_RUN_S)
 
@@ -90,8 +88,7 @@ def main():
         #    Si no lo quieres, comenta estas dos líneas.
         txrx(ser, frame(ADDR, 0xF6, bytes([0x00, 0x00, ACC_RUN])), "stop_F6_accN")
 
-        # 7) DISABLE (loose shaft): 0xF3 0x00
-        txrx(ser, frame(ADDR, 0xF3, bytes([0x00])), "disable_F3_00")
+
 
 
 if __name__ == "__main__":
