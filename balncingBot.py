@@ -12,12 +12,10 @@ ADDR = 0x01
 RPM_RUN = 10        # 0..3000
 ACC_RUN = 2         # 0..255
 
-RUN_TIME_S = 1.0
-
-# Ventanas para intentar capturar RX (no crítico)
-SER_TIMEOUT = 0.05
-T_PRE_READ  = 0.03
-T_WINDOW    = 0.25
+WAIT_AFTER_RUN = 0.5
+TIMEOUT_SERIAL = 0.05     # timeout corto; nosotros hacemos “polling” por ventana
+T_PRE_READ = 0.03         # 30 ms para que el adaptador auto-direction pase a RX
+T_WINDOW = 0.5            # ventana de captura de respuestas tras cada TX
 # =========================================
 
 
@@ -32,8 +30,9 @@ def frame(addr: int, code: int, payload: bytes = b"") -> bytes:
 
 def build_f6_speed(addr: int, rpm: int, acc: int, cw: bool = True) -> bytes:
     """
-    Speed mode (F6): word de 16 bits con bit15=dir, bits0..14=rpm.
-    Manual: speed 0..3000 rpm, acc 0..255; stop => speed=0. :contentReference[oaicite:4]{index=4}
+    Speed mode (F6): Byte4..Byte5 codifican dirección + velocidad.
+    Manual: bit más alto indica dirección. Rango velocidad 0..3000. :contentReference[oaicite:3]{index=3}
+    Usamos un word: bit15=dir, bits0..14=rpm.
     """
     if not (0 <= rpm <= 3000):
         raise ValueError("RPM fuera de rango (0..3000)")
@@ -42,14 +41,15 @@ def build_f6_speed(addr: int, rpm: int, acc: int, cw: bool = True) -> bytes:
 
     word = rpm & 0x7FFF
     if not cw:
-        word |= 0x8000
+        word |= 0x8000  # si quieres invertir
 
     b4 = (word >> 8) & 0xFF
     b5 = word & 0xFF
     return frame(addr, 0xF6, bytes([b4, b5, acc & 0xFF]))
 
 
-def read_window(ser: serial.Serial, t_window: float) -> bytes:
+def read_window_raw(ser: serial.Serial, t_window: float) -> bytes:
+    """Lee bytes durante una ventana de tiempo."""
     t0 = time.time()
     buf = b""
     while (time.time() - t0) < t_window:
@@ -60,71 +60,78 @@ def read_window(ser: serial.Serial, t_window: float) -> bytes:
     return buf
 
 
-def txrx(ser: serial.Serial, tx: bytes, tag: str):
+def extract_fb_frames(rx: bytes):
+    """
+    Extrae frames de uplink tipo:
+      FB addr code data CRC  (5 bytes)
+    Muchos ACK del manual son de 5 bytes. 
+    Si llega basura o concatenación, intentamos resincronizar buscando 0xFB.
+    """
+    frames = []
+    i = 0
+    while True:
+        j = rx.find(b"\xFB", i)
+        if j < 0:
+            break
+        if j + 5 <= len(rx):
+            cand = rx[j:j+5]
+            if checksum8(cand[:-1]) == cand[-1]:
+                frames.append(cand)
+                i = j + 5
+            else:
+                # CRC no cuadra: avanza 1 byte para re-sincronizar
+                i = j + 1
+        else:
+            break
+    return frames
+
+
+def txrx(ser: serial.Serial, tx: bytes, tag: str,
+         t_pre: float = T_PRE_READ, t_window: float = T_WINDOW):
+    # NO hacemos reset_input_buffer aquí a lo loco: leemos y parseamos.
     ser.write(tx)
     ser.flush()
     print(f"TX {tag}: {tx.hex(' ')}")
 
-    # Intento de lectura de respuesta (no bloqueante)
-    time.sleep(T_PRE_READ)
-    raw = read_window(ser, T_WINDOW)
+    time.sleep(t_pre)
+    raw = read_window_raw(ser, t_window)
+
     if raw:
-        print(f"RX {tag}: {raw.hex(' ')}")
+        frames = extract_fb_frames(raw)
+        if frames:
+            for k, fr in enumerate(frames):
+                print(f"RX {tag}[{k}]: {fr.hex(' ')}")
+        else:
+            print(f"RX {tag}: bytes no parseados: {raw.hex(' ')}")
     else:
         print(f"RX {tag}: <sin respuesta>")
+
     return raw
 
 
-def restore_respond_active_default(ser: serial.Serial):
-    """
-    Si previamente te quedaste sin respuesta por 8C, esta es la trama
-    para volver al default XX=01 YY=01:
-      FA 01 8C 01 01 89  (para addr=1)
-    Manual 5.2.12 :contentReference[oaicite:5]{index=5}
-    """
-    tx = frame(ADDR, 0x8C, bytes([0x01, 0x01]))
-    txrx(ser, tx, "restore_8C_resp1_act1")
-
-
 def main():
-    with serial.Serial(PORT, BAUD, timeout=SER_TIMEOUT) as ser:
+    with serial.Serial(PORT, BAUD, timeout=TIMEOUT_SERIAL) as ser:
         ser.reset_input_buffer()
         ser.reset_output_buffer()
 
-        # Si sospechas que el motor está en no-response por 8C, descomenta:
-        # restore_respond_active_default(ser)
-        # time.sleep(0.1)
-
-        # 1) Speed mode: SR_vFOC (82 05) :contentReference[oaicite:6]{index=6}
-        txrx(ser, frame(ADDR, 0x82, bytes([0x05])), "mode_82_sr_vfoc")
-
-        # 2) Enable: F3 01 :contentReference[oaicite:7]{index=7}
+        # 2) ENABLE: FA 01 F3 01 EF :contentReference[oaicite:7]{index=7}
         txrx(ser, frame(ADDR, 0xF3, bytes([0x01])), "enable_F3_01")
 
-        # 3) Run 10 rpm: F6 speed=10 acc=2 :contentReference[oaicite:8]{index=8}
+        # 3) RUN 10 rpm (F6) :contentReference[oaicite:8]{index=8}
         txrx(ser, build_f6_speed(ADDR, RPM_RUN, ACC_RUN, cw=True), "run_F6_10rpm")
 
-        time.sleep(RUN_TIME_S)
+        time.sleep(WAIT_AFTER_RUN)
 
-        # 4) STOP robusto:
-        #    a) stop inmediato (acc=0) 2 veces
-        #    b) stop suave (acc=ACC_RUN) 2 veces
-        #    c) emergency stop F7 como "último recurso" 
-        for i in range(2):
-            txrx(ser, build_f6_speed(ADDR, 0, 0, cw=True), f"stop_F6_acc0_{i}")
-            time.sleep(0.05)
+        # 4) STOP inmediato: F6 speed=0 acc=0  (ejemplo: FA 01 F6 00 00 00 F1) :contentReference[oaicite:9]{index=9}
+        raw_stop = txrx(ser, build_f6_speed(ADDR, 0, 0, cw=True), "stop_F6_acc0")
 
-        for i in range(2):
-            txrx(ser, build_f6_speed(ADDR, 0, ACC_RUN, cw=True), f"stop_F6_accN_{i}")
-            time.sleep(0.05)
+        # 5) DISABLE: FA 01 F3 00 EE :contentReference[oaicite:10]{index=10}
+        raw_dis = txrx(ser, frame(ADDR, 0xF3, bytes([0x00])), "disable_F3_00")
 
-        txrx(ser, frame(ADDR, 0xF7, b""), "estop_F7")
-
-        time.sleep(0.2)
-
-        # 5) Disable (loose shaft): F3 00 (esto NO es stop; es “soltar”) :contentReference[oaicite:10]{index=10}
-        txrx(ser, frame(ADDR, 0xF3, bytes([0x00])), "disable_F3_00")
-
+        # 6) Si no hay respuesta a stop o disable, lanza E-STOP (F7) como salvavidas
+        # Manual: “You can also use emergency stop command F7H”. Ejemplo FA 01 F7 F2 
+        if (not raw_stop) or (not raw_dis):
+            txrx(ser, frame(ADDR, 0xF7, b""), "estop_F7")
 
 if __name__ == "__main__":
     main()
