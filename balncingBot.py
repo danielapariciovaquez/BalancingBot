@@ -70,8 +70,6 @@ def main():
         ser.reset_input_buffer()
         ser.reset_output_buffer()
 
-        # 1) Set work mode = SR_vFOC (speed mode) : 0x82 0x05
-        txrx(ser, frame(ADDR, 0x82, bytes([0x05])), "mode_SR_vFOC")
 
         # 2) ENABLE (shaft lock): 0xF3 0x01
         txrx(ser, frame(ADDR, 0xF3, bytes([0x01])), "enable_F3_01")
