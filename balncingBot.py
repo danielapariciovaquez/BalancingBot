@@ -11,7 +11,7 @@ TIMEOUT = 0.2
 
 ADDR = 0x01
 
-RPM_RUN = 2        # 0..3000
+RPM_RUN = 10        # 0..3000
 ACC_RUN = 0x02      # 0..255 (aceleración para run/stop suave)
 WAIT_RUN_S = 1.0    # tiempo girando antes de parar
 
@@ -76,21 +76,10 @@ def main():
         # 2) ENABLE (shaft lock): 0xF3 0x01
         txrx(ser, frame(ADDR, 0xF3, bytes([0x01])), "enable_F3_01")
 
-        # 3) RUN 10 rpm (F6): speed_word=0x000A => [0x00,0x0A], acc=ACC_RUN
-        txrx(ser, frame(ADDR, 0xF6, bytes([0x00, '5' & 0xFF, ACC_RUN])), "run_F6_10rpm")
 
         time.sleep(WAIT_RUN_S)
 
-        # 4) STOP inmediato (F6 speed=0 acc=0)
-        txrx(ser, frame(ADDR, 0xF6, bytes([0x00, 0x00, 0x00])), "stop_F6_acc0")
 
-        # 5) STOP suave (opcional) (F6 speed=0 acc=ACC_RUN)
-        #    Si no lo quieres, comenta estas dos líneas.
-        txrx(ser, frame(ADDR, 0xF6, bytes([0x00, 0x00, ACC_RUN])), "stop_F6_accN")
-
-        # 6) EMERGENCY STOP (F7) (opcional pero útil para test)
-        #    Si no lo quieres, comenta estas dos líneas.
-        txrx(ser, frame(ADDR, 0xF7, b"")), "estop_F7"
 
         # 7) DISABLE (loose shaft): 0xF3 0x00
         txrx(ser, frame(ADDR, 0xF3, bytes([0x00])), "disable_F3_00")
