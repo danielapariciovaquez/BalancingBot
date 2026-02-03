@@ -75,6 +75,8 @@ def main():
 
         # 3) RUN 10 rpm (F6): speed_word=0x000A => [0x00,0x0A], acc=ACC_RUN
         txrx(ser, frame(ADDR, 0xF6, bytes([0x00, 100 & 0xFF, ACC_RUN])), "run_F6_10rpm")
+        txrx(ser, frame(ADDR, 0xF6, bytes([0x00, 10 & 0xFF, ACC_RUN])), "run_F6_10rpm")
+
 
         time.sleep(WAIT_RUN_S)
 
