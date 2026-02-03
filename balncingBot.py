@@ -11,7 +11,7 @@ TIMEOUT = 0.2
 
 ADDR = 0x01
 
-RPM_RUN = 10        # 0..3000
+RPM_RUN = 100        # 0..3000
 ACC_RUN = 0x02      # 0..255 (aceleración para run/stop suave)
 WAIT_RUN_S = 1.0    # tiempo girando antes de parar
 
