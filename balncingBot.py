@@ -14,64 +14,71 @@ TIMEOUT_S = 0.05
 ADDR_LEFT  = 0x01
 ADDR_RIGHT = 0x02
 
-MAX_RPM = 300
+MAX_RPM = 300          # límite absoluto
 ACC = 255
 
-DEADZONE = 0.001
+DEADZONE = 0.08
+UPDATE_HZ = 100        # control más rápido para balanceo
 
-# Para balanceo suele interesar más frecuencia que 50 Hz.
-# Si tu RPi va bien, 100-200 Hz suele ser razonable. Aquí dejo 100 Hz por defecto.
-UPDATE_HZ = 100
-
-# Joystick (tus valores memorizados)
 AXIS_THROTTLE = 1
 AXIS_TURN     = 3
 
 INVERT_LEFT  = False
 INVERT_RIGHT = True
+
+# Limitar sensibilidad de giro (joystick)
+# turn_scaled = clamp(turn, -1..1) * TURN_SCALE
+TURN_SCALE = 0.20      # 0.2 = 20% del giro original (reduce MUCHO)
+# Además limitamos el diferencial máximo a un valor fijo (rpm)
+TURN_MAX_RPM = 60      # límite duro del giro (rpm)
 # ====================================================================
 
 # ===================== CONFIG (GY-521 / MPU6050) =====================
 I2C_BUS = 1
-MPU_ADDR = 0x68  # AD0=0 típico; si AD0=1 -> 0x69
+MPU_ADDR = 0x68
 
-# Registros
 REG_PWR_MGMT_1   = 0x6B
-REG_ACCEL_XOUT_H = 0x3B  # AX_H..AZ_L son 0x3B..0x40
-REG_GYRO_YOUT_H  = 0x45  # GY_H=0x45, GY_L=0x46
+REG_ACCEL_XOUT_H = 0x3B  # AX_H..AZ_L
+REG_GYRO_YOUT_H  = 0x45  # GY_H..GY_L
 
-# Escalas por defecto típicas si no configuras rangos:
-# Accel ±2g => 16384 LSB/g
-# Gyro  ±250 dps => 131 LSB/(°/s)
 ACC_LSB_PER_G = 16384.0
 GYRO_LSB_PER_DPS = 131.0
 
-# Calibraciones al arranque (sensor quieto y robot en posición vertical de equilibrio)
-CAL_SAMPLES_GYRO = 800
+CAL_SAMPLES_GYRO  = 800
 CAL_SAMPLES_ACCEL = 200
 
-# Seguridad
-ANGLE_CUTOFF_DEG = 35.0  # si se cae más allá, corta salida de motor
-DT_MAX = 0.05            # clamp dt para evitar integraciones gigantes por jitter
+ANGLE_CUTOFF_DEG = 35.0
+DT_MAX = 0.05
 # ====================================================================
 
-# ===================== BALANCE CONTROL =====================
-# Setpoint de equilibrio (0 deg tras calibrar)
+# ===================== KALMAN =====================
+# Ajustes más “suaves” para reducir ruido de ángulo
+KAL_Q_ANGLE = 0.0005
+KAL_Q_BIAS  = 0.003
+KAL_R_MEAS  = 0.05
+# ====================================================================
+
+# ===================== BALANCE CONTROL (PID) =====================
 SETPOINT_DEG = 0.0
 
-# Joystick -> setpoint (lean-to-go)
-# throttle [-1..1] se convierte a offset de setpoint (grados).
-# AJUSTA este límite según tu mecánica; no hay valor universal.
-MAX_SETPOINT_OFFSET_DEG = 10.0
+MAX_SETPOINT_OFFSET_DEG = 10.0  # throttle -> inclinación deseada
 
-# PID sobre el ángulo (salida en "rpm base")
-# OJO: hay que tunear en tu robot. Empezar con Ki=0 suele ser más seguro.
+# Gains más conservadores + más amortiguación
 Kp = 10.0
 Ki = 0.0
-Kd = 1.9
+Kd = 1.6
 
-# Limitación integral (anti-windup) en unidades de "rpm equivalente"
+# Anti-windup (aunque Ki=0)
 I_LIM = 200.0
+
+# Limitación del balanceo (mucho más baja que MAX_RPM para evitar latigazos)
+BAL_MAX_RPM = 120
+
+# Derivative low-pass
+D_TAU = 0.05  # s
+
+# Slew-rate limit (rpm/s) para evitar vibración por cambios bruscos
+MAX_RPM_STEP_PER_S = 800.0
 # ====================================================================
 
 # --- I2C backend (smbus2 preferente, si no smbus) ---
@@ -159,34 +166,23 @@ def mpu_wake(bus: SMBus) -> None:
     time.sleep(0.05)
 
 def read_accel_gyro(bus: SMBus):
-    # Accel X,Z y Gyro Y
     ax = read_i16_be(bus, MPU_ADDR, REG_ACCEL_XOUT_H)       # 0x3B
-    # ay = read_i16_be(bus, MPU_ADDR, REG_ACCEL_XOUT_H + 2)  # 0x3D (no usado)
     az = read_i16_be(bus, MPU_ADDR, REG_ACCEL_XOUT_H + 4)   # 0x3F
     gy = read_i16_be(bus, MPU_ADDR, REG_GYRO_YOUT_H)        # 0x45
     return ax, az, gy
 
 def accel_angle_deg_from_ax_az(ax_raw: int, az_raw: int) -> float:
     """
-    Ángulo de pitch derivado de acelerómetro usando AX y AZ.
-    El resultado depende de cómo esté orientado tu módulo.
-    Aquí usamos atan2(ax, az).
-    REQUISITO tuyo: al inclinar hacia adelante, el ángulo DECREMENTA.
-    Para imponerlo, invertimos el signo.
+    Pitch a partir de AX/AZ.
+    Requisito: inclinación hacia delante => ángulo decrementa.
     """
     ax_g = ax_raw / ACC_LSB_PER_G
     az_g = az_raw / ACC_LSB_PER_G
     ang = math.degrees(math.atan2(ax_g, az_g))
-    return -ang  # <-- fuerza: forward tilt => ángulo decrece
+    return -ang  # forward tilt => decrement
 
 class Kalman1D:
-    """
-    Kalman 1D típico para ángulo con bias de gyro:
-      state: [angle, bias]
-      input: gyro_rate (deg/s)
-      measurement: accel_angle (deg)
-    """
-    def __init__(self, q_angle=0.001, q_bias=0.003, r_measure=0.03):
+    def __init__(self, q_angle=KAL_Q_ANGLE, q_bias=KAL_Q_BIAS, r_measure=KAL_R_MEAS):
         self.q_angle = float(q_angle)
         self.q_bias = float(q_bias)
         self.r_measure = float(r_measure)
@@ -202,19 +198,15 @@ class Kalman1D:
         self.angle = float(angle_deg)
 
     def update(self, meas_angle_deg: float, gyro_rate_dps: float, dt: float) -> float:
-        # Predict
         rate = gyro_rate_dps - self.bias
         self.angle += dt * rate
 
-        # Covariance predict
         P00 = self.P00 + dt * (dt*self.P11 - self.P01 - self.P10 + self.q_angle)
         P01 = self.P01 - dt * self.P11
         P10 = self.P10 - dt * self.P11
         P11 = self.P11 + self.q_bias * dt
-
         self.P00, self.P01, self.P10, self.P11 = P00, P01, P10, P11
 
-        # Update
         y = meas_angle_deg - self.angle
         S = self.P00 + self.r_measure
         K0 = self.P00 / S
@@ -227,7 +219,6 @@ class Kalman1D:
         P01 = self.P01 - K0 * self.P01
         P10 = self.P10 - K1 * self.P00
         P11 = self.P11 - K1 * self.P01
-
         self.P00, self.P01, self.P10, self.P11 = P00, P01, P10, P11
         return self.angle
 
@@ -240,10 +231,6 @@ def calibrate_gyro_y_bias(bus: SMBus) -> float:
     return s / float(CAL_SAMPLES_GYRO)
 
 def calibrate_accel_angle_zero(bus: SMBus) -> float:
-    """
-    Promedia el ángulo del acelerómetro en la posición inicial.
-    Se usa como offset para que el ángulo inicial sea 0 deg.
-    """
     s = 0.0
     for _ in range(CAL_SAMPLES_ACCEL):
         ax, az, _ = read_accel_gyro(bus)
@@ -268,7 +255,6 @@ def motors_from_balance(base_rpm: float, turn_rpm: float) -> MotorCmd:
 def main() -> int:
     i2c_require()
 
-    # I2C init
     bus = SMBus(I2C_BUS)
     try:
         mpu_wake(bus)
@@ -286,16 +272,13 @@ def main() -> int:
         bus.close()
         return 4
 
-    # Kalman init: arrancamos el ángulo en 0 tras compensar offset
     kf = Kalman1D()
     kf.set_angle(0.0)
 
-    print(f"OK. Bias Gy={gyro_y_bias_dps:.6f} °/s | AccelZero={accel_zero_deg:.6f} ° | Ang inicial=0.000°")
+    print(f"OK. BiasGy={gyro_y_bias_dps:.6f} °/s | AccZero={accel_zero_deg:.6f} ° | Ang0=0.000°")
 
-    # RS485 init
     ser = open_serial()
 
-    # Joystick init
     pygame.init()
     pygame.joystick.init()
 
@@ -314,9 +297,11 @@ def main() -> int:
     send(ser, cmd_enable(ADDR_RIGHT, True))
     time.sleep(0.05)
 
-    # PID state
+    # PID states
     integ = 0.0
     prev_err = 0.0
+    d_filt = 0.0
+    base_rpm_cmd = 0.0
 
     period = 1.0 / UPDATE_HZ
     t_next = time.monotonic()
@@ -334,19 +319,14 @@ def main() -> int:
             elif dt > DT_MAX:
                 dt = DT_MAX
 
-            # --- IMU read ---
+            # IMU
             try:
                 ax, az, gy_raw = read_accel_gyro(bus)
                 accel_angle = accel_angle_deg_from_ax_az(ax, az) - accel_zero_deg
 
-                # gyro rate (deg/s), usando eje Y
                 gyro_rate = (gy_raw / GYRO_LSB_PER_DPS) - gyro_y_bias_dps
-
-                # coherencia de signo: si forward tilt => angle decrece.
-                # Ya lo impusimos en accel_angle; el gyro debe seguir el mismo convenio.
-                # Si al inclinar hacia adelante el gyro_rate sale con signo contrario al accel,
-                # invierte aquí: gyro_rate = -gyro_rate
-                # (lo dejamos como está por defecto; se corrige con una sola inversión si hiciera falta)
+                # Si gyro tiene signo opuesto al accel en tu montaje, descomenta:
+                # gyro_rate = -gyro_rate
 
                 angle = kf.update(accel_angle, gyro_rate, dt)
 
@@ -356,18 +336,18 @@ def main() -> int:
                 gyro_rate = 0.0
                 accel_angle = 0.0
 
-            # --- Safety cutoff ---
+            # Safety cutoff
             if abs(angle) > ANGLE_CUTOFF_DEG:
-                # Cae: corta mando a 0 hasta que el ángulo vuelva dentro de rango
-                mc = MotorCmd(0, 0)
                 send(ser, cmd_speed(ADDR_LEFT, 0, 0))
                 send(ser, cmd_speed(ADDR_RIGHT, 0, 0))
-                sys.stdout.write(f"\rCAIDO: Ang={angle:+07.2f} deg (cutoff) -> motores 0 rpm                 ")
-                sys.stdout.flush()
-                # sigue loop sin integrar PID (evita windup)
                 integ = 0.0
                 prev_err = 0.0
-                # timing
+                d_filt = 0.0
+                base_rpm_cmd = 0.0
+
+                sys.stdout.write(f"\rCAIDO: Ang={angle:+07.2f} deg -> motores 0 rpm                           ")
+                sys.stdout.flush()
+
                 t_next += period
                 sleep_s = t_next - time.monotonic()
                 if sleep_s > 0:
@@ -376,41 +356,51 @@ def main() -> int:
                     t_next = time.monotonic()
                 continue
 
-            # --- Joystick -> setpoint y giro ---
+            # Joystick -> setpoint + turn
             thr = -joy.get_axis(AXIS_THROTTLE)
-            trn = joy.get_axis(AXIS_TURN)/10
+            trn = joy.get_axis(AXIS_TURN)
 
             thr = clamp(dz(thr, DEADZONE), -1.0, 1.0)
             trn = clamp(dz(trn, DEADZONE), -1.0, 1.0)
 
             setpoint = SETPOINT_DEG + thr * MAX_SETPOINT_OFFSET_DEG
 
-            # --- PID balance -> base rpm ---
+            # Giro muy limitado
+            trn = clamp(trn * TURN_SCALE, -1.0, 1.0)
+            turn_rpm = clamp(trn * MAX_RPM, -TURN_MAX_RPM, +TURN_MAX_RPM)
+
+            # PID balance
             err = setpoint - angle
 
-            # Integral (anti-windup)
             integ += err * dt
             integ = clamp(integ, -I_LIM, I_LIM)
 
             derr = (err - prev_err) / dt if dt > 0 else 0.0
             prev_err = err
 
-            # Salida PID en rpm (escala directa por gains)
-            base_rpm = (Kp * err) + (Ki * integ) + (Kd * derr)
-            base_rpm = clamp(base_rpm, -MAX_RPM, MAX_RPM)
+            alpha = dt / (D_TAU + dt)
+            d_filt += alpha * (derr - d_filt)
 
-            # Turn: lo aplicamos como diferencial en rpm
-            turn_rpm = trn * MAX_RPM
-            mc = motors_from_balance(base_rpm, turn_rpm)
+            base_rpm = (Kp * err) + (Ki * integ) + (Kd * d_filt)
+            base_rpm = clamp(base_rpm, -BAL_MAX_RPM, +BAL_MAX_RPM)
 
-            # --- RS485 send ---
+            # Slew-rate
+            max_step = MAX_RPM_STEP_PER_S * dt
+            delta = clamp(base_rpm - base_rpm_cmd, -max_step, +max_step)
+            base_rpm_cmd += delta
+            base_rpm_cmd = clamp(base_rpm_cmd, -BAL_MAX_RPM, +BAL_MAX_RPM)
+
+            mc = motors_from_balance(base_rpm_cmd, turn_rpm)
+
+            # RS485 send
             send(ser, cmd_speed(ADDR_LEFT, mc.left_rpm, ACC))
             send(ser, cmd_speed(ADDR_RIGHT, mc.right_rpm, ACC))
 
-            # --- Print status ---
+            # Debug
             sys.stdout.write(
-                f"\rAng={angle:+07.2f} deg | Acc={accel_angle:+07.2f} | Gy={gyro_rate:+07.2f} dps | "
-                f"SP={setpoint:+06.2f} | base={base_rpm:+06.1f} | L={mc.left_rpm:+04d} R={mc.right_rpm:+04d}    "
+                f"\rAng={angle:+07.2f} | Acc={accel_angle:+07.2f} | Gy={gyro_rate:+07.2f} dps | "
+                f"SP={setpoint:+06.2f} | base={base_rpm_cmd:+06.1f} | turn={turn_rpm:+06.1f} | "
+                f"L={mc.left_rpm:+04d} R={mc.right_rpm:+04d}     "
             )
             sys.stdout.flush()
 
