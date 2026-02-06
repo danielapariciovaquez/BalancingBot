@@ -14,40 +14,31 @@ TIMEOUT_S = 0.05
 ADDR_LEFT  = 0x01
 ADDR_RIGHT = 0x02
 
-MAX_RPM = 300          # límite absoluto del comando F6
+MAX_RPM = 300
 ACC = 255
 
-# Balance output limit (arranca conservador)
-BAL_MAX_RPM = 50
+BAL_MAX_RPM = 140
 
-# RS485 pacing / robust enable
 INTER_FRAME_DELAY_S = 0.004
 ENABLE_RETRIES = 2
 ENABLE_RETRY_DELAY_S = 0.02
 
-# Motores montados en sentidos opuestos
 INVERT_LEFT  = False
 INVERT_RIGHT = True
 # ===========================================================
 
 # ===================== CONTROL LOOP =====================
-UPDATE_HZ = 200        # recomendado 100-200 Hz
+UPDATE_HZ = 150
 DT_MAX = 0.05
 
-# Cutoff si se cae
 ANGLE_CUTOFF_DEG = 35.0
-
-# Slew-rate de salida (rpm/s)
-MAX_RPM_STEP_PER_S = 200.0
+MAX_RPM_STEP_PER_S = 700.0
 # =========================================================
 
-# ===================== PID (en realidad PD+gyro) =====================
-# u_rpm = Kp*(0 - angle) - Kd*gyro_rate + Ki*integral
-# Recomendación: empezar con Ki=0.
-PID_INIT_KP = 12.0     # rpm/deg
-PID_INIT_KI = 0.0      # rpm/(deg*s)
-PID_INIT_KD = 2.2      # rpm/(deg/s)
-
+# ===================== CONTROL (PD+gyro) =====================
+PID_INIT_KP = 12.0
+PID_INIT_KI = 0.0
+PID_INIT_KD = 2.2
 I_LIM = 200.0
 # =========================================================
 
@@ -65,13 +56,13 @@ GYRO_LSB_PER_DPS = 131.0
 CAL_SAMPLES_GYRO  = 800
 CAL_SAMPLES_ACCEL = 200
 
-# Kalman (suave)
-KAL_Q_ANGLE = 0.0005
-KAL_Q_BIAS  = 0.003
-KAL_R_MEAS  = 0.05
-
 # Si el gyro sale con signo opuesto al accel en tu montaje:
 INVERT_GYRO_RATE = False
+
+# ===== Filtro complementario =====
+# alpha cercano a 1: confías más en gyro (menos ruido) pero más deriva
+# alpha más bajo: más accel (más ruido) pero menos deriva
+COMP_ALPHA = 0.985
 # ===========================================================
 
 # ===================== WEB UI =====================
@@ -83,7 +74,6 @@ KI_RANGE = (0.0, 50.0)
 KD_RANGE = (0.0, 30.0)
 # ===========================================================
 
-# --- I2C backend (smbus2 preferente, si no smbus) ---
 try:
     from smbus2 import SMBus
 except ImportError:
@@ -92,7 +82,6 @@ except ImportError:
     except ImportError:
         SMBus = None
 
-# --- Web backend ---
 try:
     from flask import Flask, request, jsonify
 except ImportError:
@@ -196,47 +185,7 @@ def accel_angle_deg_from_ax_az(ax_raw: int, az_raw: int) -> float:
     ax_g = ax_raw / ACC_LSB_PER_G
     az_g = az_raw / ACC_LSB_PER_G
     ang = math.degrees(math.atan2(ax_g, az_g))
-    return -ang  # forward tilt => decrement
-
-class Kalman1D:
-    def __init__(self, q_angle=KAL_Q_ANGLE, q_bias=KAL_Q_BIAS, r_measure=KAL_R_MEAS):
-        self.q_angle = float(q_angle)
-        self.q_bias = float(q_bias)
-        self.r_measure = float(r_measure)
-        self.angle = 0.0
-        self.bias = 0.0
-        self.P00 = 1.0
-        self.P01 = 0.0
-        self.P10 = 0.0
-        self.P11 = 1.0
-
-    def set_angle(self, angle_deg: float):
-        self.angle = float(angle_deg)
-
-    def update(self, meas_angle_deg: float, gyro_rate_dps: float, dt: float) -> float:
-        rate = gyro_rate_dps - self.bias
-        self.angle += dt * rate
-
-        P00 = self.P00 + dt * (dt*self.P11 - self.P01 - self.P10 + self.q_angle)
-        P01 = self.P01 - dt * self.P11
-        P10 = self.P10 - dt * self.P11
-        P11 = self.P11 + self.q_bias * dt
-        self.P00, self.P01, self.P10, self.P11 = P00, P01, P10, P11
-
-        y = meas_angle_deg - self.angle
-        S = self.P00 + self.r_measure
-        K0 = self.P00 / S
-        K1 = self.P10 / S
-
-        self.angle += K0 * y
-        self.bias  += K1 * y
-
-        P00 = self.P00 - K0 * self.P00
-        P01 = self.P01 - K0 * self.P01
-        P10 = self.P10 - K1 * self.P00
-        P11 = self.P11 - K1 * self.P01
-        self.P00, self.P01, self.P10, self.P11 = P00, P01, P10, P11
-        return self.angle
+    return -ang
 
 def calibrate_gyro_y_bias(bus: SMBus) -> float:
     s = 0.0
@@ -326,8 +275,7 @@ def start_web_server():
       <input id="kd" type="range" min="{KD_RANGE[0]}" max="{KD_RANGE[1]}" step="0.1">
     </div>
     <div class="small">
-      Consejo: empieza con <code>Ki=0</code>. Ajusta <code>Kp</code> (levanta) y luego <code>Kd</code> (amortigua).
-      <br/>API: <code>GET/POST /pid</code>.
+      Filtro: <code>Complementario</code> (α={COMP_ALPHA}). Consejo: empieza con <code>Ki=0</code>.
     </div>
   </div>
 
@@ -336,7 +284,6 @@ async function getPID() {{
   const r = await fetch('/pid');
   return await r.json();
 }}
-
 async function setPID(kp,ki,kd) {{
   await fetch('/pid', {{
     method: 'POST',
@@ -344,7 +291,6 @@ async function setPID(kp,ki,kd) {{
     body: JSON.stringify({{kp:kp, ki:ki, kd:kd}})
   }});
 }}
-
 function bindSlider(id, labId, fmt) {{
   const s = document.getElementById(id);
   const l = document.getElementById(labId);
@@ -352,17 +298,14 @@ function bindSlider(id, labId, fmt) {{
   s.addEventListener('input', upd);
   return {{slider:s, updateLabel:upd}};
 }}
-
 (async () => {{
   const pid = await getPID();
   const kp = bindSlider('kp','kpv',v=>v.toFixed(1));
   const ki = bindSlider('ki','kiv',v=>v.toFixed(2));
   const kd = bindSlider('kd','kdv',v=>v.toFixed(1));
-
   kp.slider.value = pid.kp; kp.updateLabel();
   ki.slider.value = pid.ki; ki.updateLabel();
   kd.slider.value = pid.kd; kd.updateLabel();
-
   let t = null;
   const push = () => {{
     clearTimeout(t);
@@ -370,7 +313,6 @@ function bindSlider(id, labId, fmt) {{
       setPID(parseFloat(kp.slider.value), parseFloat(ki.slider.value), parseFloat(kd.slider.value));
     }}, 120);
   }};
-
   kp.slider.addEventListener('input', push);
   ki.slider.addEventListener('input', push);
   kd.slider.addEventListener('input', push);
@@ -387,7 +329,7 @@ function bindSlider(id, labId, fmt) {{
     @app.get("/pid")
     def pid_get():
         kp, ki, kd = get_pid()
-        return jsonify({"kp": kp, "ki": ki, "kd": kd})
+        return {"kp": kp, "ki": ki, "kd": kd}
 
     @app.post("/pid")
     def pid_post():
@@ -414,7 +356,6 @@ def main() -> int:
         print("ERROR: Flask no instalado. Instala: pip3 install flask", file=sys.stderr)
         return 1
 
-    # Arranca web en hilo aparte
     th = threading.Thread(target=start_web_server, daemon=True)
     th.start()
     print(f"Web PID: http://<IP_RPI>:{WEB_PORT}/")
@@ -436,13 +377,12 @@ def main() -> int:
         bus.close()
         return 4
 
-    kf = Kalman1D()
-    kf.set_angle(0.0)
+    # ángulo inicial (tras calibración) = 0
+    angle = 0.0
+
     print(f"OK. BiasGy={gyro_y_bias_dps:.6f} °/s | AccZero={accel_zero_deg:.6f} ° | Ang0=0.000°")
 
     ser = open_serial()
-
-    # Enable robusto con separación y reintentos
     send_enable_robust(ser, ADDR_LEFT, True)
     send_enable_robust(ser, ADDR_RIGHT, True)
 
@@ -463,19 +403,23 @@ def main() -> int:
             elif dt > DT_MAX:
                 dt = DT_MAX
 
-            # IMU
+            # IMU -> accel angle + gyro rate
             try:
                 ax, az, gy_raw = read_accel_gyro(bus)
                 accel_angle = accel_angle_deg_from_ax_az(ax, az) - accel_zero_deg
                 gyro_rate = (gy_raw / GYRO_LSB_PER_DPS) - gyro_y_bias_dps
                 if INVERT_GYRO_RATE:
                     gyro_rate = -gyro_rate
-                angle = kf.update(accel_angle, gyro_rate, dt)
             except Exception as e:
                 print(f"\nWARNING I2C: lectura IMU falló: {e}", file=sys.stderr)
-                angle = kf.angle
-                gyro_rate = 0.0
                 accel_angle = 0.0
+                gyro_rate = 0.0
+
+            # ======= Filtro complementario =======
+            # Predicción con gyro (integración)
+            angle_gyro = angle + gyro_rate * dt
+            # Corrección con accel
+            angle = (COMP_ALPHA * angle_gyro) + ((1.0 - COMP_ALPHA) * accel_angle)
 
             # Safety cutoff
             if abs(angle) > ANGLE_CUTOFF_DEG:
@@ -483,6 +427,7 @@ def main() -> int:
                 send_paced(ser, cmd_speed(ADDR_RIGHT, 0, 0))
                 integ = 0.0
                 base_rpm_cmd = 0.0
+                angle = 0.0  # opcional: reancla para que no se quede "lejos"
                 sys.stdout.write(f"\rCAIDO: Ang={angle:+07.2f} deg -> motores 0 rpm                           ")
                 sys.stdout.flush()
 
@@ -500,15 +445,14 @@ def main() -> int:
             # Error con setpoint=0
             err = 0.0 - angle
 
-            # Integral opcional (por defecto Ki=0)
             integ += err * dt
             integ = clamp(integ, -I_LIM, I_LIM)
 
-            # Control PD con gyro directo (amortiguación real)
+            # PD con gyro directo + integral opcional
             base_rpm = (kp * err) - (kd * gyro_rate) + (ki * integ)
             base_rpm = clamp(base_rpm, -BAL_MAX_RPM, +BAL_MAX_RPM)
 
-            # Slew-rate (anti latigazo)
+            # Slew-rate
             max_step = MAX_RPM_STEP_PER_S * dt
             delta = clamp(base_rpm - base_rpm_cmd, -max_step, +max_step)
             base_rpm_cmd += delta
@@ -516,19 +460,16 @@ def main() -> int:
 
             mc = motors_from_balance(base_rpm_cmd)
 
-            # RS485 send con separación
             send_paced(ser, cmd_speed(ADDR_LEFT, mc.left_rpm, ACC))
             send_paced(ser, cmd_speed(ADDR_RIGHT, mc.right_rpm, ACC))
 
-            # Debug (una línea)
             sys.stdout.write(
                 f"\rAng={angle:+07.2f} | Acc={accel_angle:+07.2f} | Gy={gyro_rate:+07.2f} dps | "
-                f"PID(kp={kp:5.1f},ki={ki:5.2f},kd={kd:5.1f}) | "
+                f"α={COMP_ALPHA:.3f} | PID(kp={kp:5.1f},ki={ki:5.2f},kd={kd:5.1f}) | "
                 f"base={base_rpm_cmd:+06.1f} | L={mc.left_rpm:+04d} R={mc.right_rpm:+04d}     "
             )
             sys.stdout.flush()
 
-            # timing
             t_next += period
             sleep_s = t_next - time.monotonic()
             if sleep_s > 0:
