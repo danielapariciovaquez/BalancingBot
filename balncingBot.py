@@ -1,237 +1,205 @@
 #!/usr/bin/env python3
 import time
-import math
-import signal
-import threading
+import serial
+import pygame
+import sys
 from dataclasses import dataclass
 
-import serial
-from mpu6050 import mpu6050
+# ===================== CONFIG =====================
+PORT = "/dev/ttyUSB0"
+BAUD = 38400
+TIMEOUT_S = 0.05
 
-# ============================================================
-# CONFIG (TOCAR AQUÍ)
-# ============================================================
+ADDR_LEFT  = 0x01
+ADDR_RIGHT = 0x02
 
-# ---- RS485 ----
-RS485_PORT = "/dev/ttyUSB0"
-RS485_BAUD = 38400
-RS485_TIMEOUT_S = 0.05
-INTER_FRAME_DELAY_S = 0.002  # deja esto: evita tramas pegadas
+# MKS: speed range 0..3000 RPM (12 bits)
+MAX_RPM = 3000
 
-MOTOR1_ADDR = 0x01
-MOTOR2_ADDR = 0x02
+# Aceleración (0..255). OJO: en el manual, acc=0 implica parada inmediata cuando speed=0.
+ACC = 50
 
-# Signos por motor (ajuste de sentido)
-M1_SIGN = +1
-M2_SIGN = -1
+# Control joystick
+DEADZONE = 0.08
+UPDATE_HZ = 50
 
-# ---- Enable ----
-ENABLE_ON_START = True   # manda F3=01 al inicio
+# Ejes típicos en mandos tipo Xbox:
+#   Left stick Y: eje 1 (arriba negativo en pygame normalmente)
+#   Right stick X: eje 3 (depende del driver)
+AXIS_THROTTLE = 1
+AXIS_TURN     = 3
 
-# ---- Speed command (F6) ----
-F6_ACC = 20        # 0..255
-MAX_RPM = 250      # límite duro de seguridad
-
-# ---- Control (proporcional a inclinación) ----
-LOOP_HZ = 100.0
-CALIB_SECONDS = 1.0
-K_RPM_PER_DEG = 20.0     # rpm por grado
-DEADZONE_DEG = 0.8
-PITCH_LP_ALPHA = 0.15    # filtro 0..1
-MAX_STEP_RPM_PER_CYCLE = 40
-
-# ---- IMU ----
-IMU_I2C_ADDR = 0x68
-
-# ============================================================
-# PROTOCOLO MKS RS485
-# Downlink: FA addr code ... CRC, CRC = sum(bytes) & 0xFF
-# ============================================================
-
-def checksum8(payload: bytes) -> int:
-    return sum(payload) & 0xFF
-
-def build_frame(addr: int, code: int, data: bytes = b"") -> bytes:
-    base = bytes([0xFA, addr & 0xFF, code & 0xFF]) + data
-    return base + bytes([checksum8(base)])
-
-def encode_f6_speed(rpm_signed: int, acc: int) -> bytes:
-    rpm = int(rpm_signed)
-    dir_bit = 1 if rpm < 0 else 0
-    speed = abs(rpm)
-
-    if speed > 3000:
-        speed = 3000
-    acc = max(0, min(255, int(acc)))
-
-    b4 = ((dir_bit & 0x01) << 7) | ((speed >> 8) & 0x0F)
-    b5 = speed & 0xFF
-    return bytes([b4, b5, acc])
+# Si un motor está montado invertido, cambia aquí (muy típico en diferencial)
+INVERT_LEFT  = False
+INVERT_RIGHT = False
+# ==================================================
 
 def clamp(x: float, lo: float, hi: float) -> float:
     return lo if x < lo else hi if x > hi else x
 
-def lp(prev: float, x: float, alpha: float) -> float:
-    return prev + alpha * (x - prev)
+def dz(x: float, dead: float) -> float:
+    return 0.0 if abs(x) < dead else x
+
+def checksum8(data: bytes) -> int:
+    return sum(data) & 0xFF  # manual: CHECKSUM 8bit
+
+def frame(addr: int, cmd: int, payload: bytes = b"") -> bytes:
+    base = bytes([0xFA, addr & 0xFF, cmd & 0xFF]) + payload
+    return base + bytes([checksum8(base)])
+
+def cmd_enable(addr: int, en: bool) -> bytes:
+    # FA addr F3 enable CRC
+    return frame(addr, 0xF3, bytes([0x01 if en else 0x00]))
+
+def cmd_speed(addr: int, rpm: int, acc: int) -> bytes:
+    """
+    F6 speed mode:
+      Byte4: bit7 = dir, bits[3:0] = speed[11:8]
+      Byte5: speed[7:0]
+      Byte6: acc (0..255)
+    speed range 0..3000 RPM
+    dir: 0/1 según manual (bit7). Aquí: rpm>=0 => dir=0, rpm<0 => dir=1
+    """
+    acc_u8 = int(clamp(acc, 0, 255))
+    if rpm >= 0:
+        direction_bit = 0
+        speed = rpm
+    else:
+        direction_bit = 1
+        speed = -rpm
+
+    speed = int(clamp(speed, 0, MAX_RPM))
+    b4 = ((direction_bit & 0x01) << 7) | ((speed >> 8) & 0x0F)
+    b5 = speed & 0xFF
+    payload = bytes([b4, b5, acc_u8])
+    return frame(addr, 0xF6, payload)
 
 @dataclass
-class MotorSigns:
-    m1: int = +1
-    m2: int = -1
+class MotorCmd:
+    left_rpm: int
+    right_rpm: int
 
-class MksRs485:
-    def __init__(self, port: str, baud: int, timeout_s: float, inter_frame_delay_s: float):
-        self.ser = serial.Serial(
-            port=port,
-            baudrate=baud,
-            bytesize=serial.EIGHTBITS,
-            parity=serial.PARITY_NONE,
-            stopbits=serial.STOPBITS_ONE,
-            timeout=timeout_s,
-        )
-        self.ifd = float(inter_frame_delay_s)
-        self.lock = threading.Lock()
+def mix_differential(throttle: float, turn: float) -> MotorCmd:
+    """
+    Mezcla diferencial estándar:
+      left  = throttle - turn
+      right = throttle + turn
+    throttle, turn en [-1..1]
+    """
+    left  = throttle - turn
+    right = throttle + turn
 
-    def close(self):
-        try:
-            self.ser.close()
-        except Exception:
-            pass
+    # Normaliza si saturan (mantiene proporción)
+    m = max(1.0, abs(left), abs(right))
+    left /= m
+    right /= m
 
-    def tx(self, addr: int, code: int, data: bytes = b"", expect_reply: bool = False) -> None:
-        # En esta versión: NO leemos RX (expect_reply=False siempre)
-        frame = build_frame(addr, code, data)
-        with self.lock:
-            self.ser.write(frame)
-            self.ser.flush()
-            time.sleep(self.ifd)
+    left_rpm = int(round(left * MAX_RPM))
+    right_rpm = int(round(right * MAX_RPM))
 
-    def enable(self, addr: int, en: bool):
-        # F3H enable: 00 loose / 01 shaft lock
-        self.tx(addr, 0xF3, bytes([0x01 if en else 0x00]), expect_reply=False)
+    if INVERT_LEFT:
+        left_rpm = -left_rpm
+    if INVERT_RIGHT:
+        right_rpm = -right_rpm
 
-    def speed_f6(self, addr: int, rpm_signed: int, acc: int):
-        # F6H speed control
-        self.tx(addr, 0xF6, encode_f6_speed(rpm_signed, acc), expect_reply=False)
+    return MotorCmd(left_rpm=left_rpm, right_rpm=right_rpm)
 
-    def stop_f6(self, addr: int, acc: int):
-        self.speed_f6(addr, 0, acc)
+def open_serial() -> serial.Serial:
+    ser = serial.Serial(
+        port=PORT,
+        baudrate=BAUD,
+        bytesize=serial.EIGHTBITS,
+        parity=serial.PARITY_NONE,
+        stopbits=serial.STOPBITS_ONE,
+        timeout=TIMEOUT_S,
+        write_timeout=TIMEOUT_S,
+    )
+    # Limpieza buffers
+    ser.reset_input_buffer()
+    ser.reset_output_buffer()
+    return ser
 
-def accel_to_pitch_deg(ax: float, ay: float, az: float) -> float:
-    pitch = math.atan2(-ax, math.sqrt(ay * ay + az * az))
-    return pitch * 180.0 / math.pi
+def send(ser: serial.Serial, data: bytes) -> None:
+    # Importante: bytes continuos sin pausas inter-byte (manual).
+    ser.write(data)
+    ser.flush()
 
-def main():
-    stop_flag = {"stop": False}
+def main() -> int:
+    ser = open_serial()
 
-    def _sig_handler(_sig, _frame):
-        stop_flag["stop"] = True
+    # --- init pygame / joystick ---
+    pygame.init()
+    pygame.joystick.init()
 
-    signal.signal(signal.SIGINT, _sig_handler)
-    signal.signal(signal.SIGTERM, _sig_handler)
+    if pygame.joystick.get_count() < 1:
+        print("ERROR: no hay joystick detectado por pygame.")
+        print("Tip: prueba `jstest /dev/input/js0` o revisa permisos /dev/input/*")
+        ser.close()
+        return 2
 
-    imu = mpu6050(IMU_I2C_ADDR)
-    bus = MksRs485(RS485_PORT, RS485_BAUD, RS485_TIMEOUT_S, INTER_FRAME_DELAY_S)
-    signs = MotorSigns(m1=M1_SIGN, m2=M2_SIGN)
+    joy = pygame.joystick.Joystick(0)
+    joy.init()
+    print(f"Joystick: {joy.get_name()} | axes={joy.get_numaxes()} buttons={joy.get_numbuttons()}")
 
-    def safe_shutdown():
-        try:
-            bus.stop_f6(MOTOR1_ADDR, acc=max(1, min(255, F6_ACC)))
-            bus.stop_f6(MOTOR2_ADDR, acc=max(1, min(255, F6_ACC)))
-            time.sleep(0.05)
-            bus.enable(MOTOR1_ADDR, False)
-            bus.enable(MOTOR2_ADDR, False)
-        except Exception:
-            pass
-        bus.close()
+    # --- ENABLE motores ---
+    send(ser, cmd_enable(ADDR_LEFT, True))
+    send(ser, cmd_enable(ADDR_RIGHT, True))
+    time.sleep(0.05)
 
-    # ---- SOLO enable (sin set_mode ni nada más) ----
-    try:
-        if ENABLE_ON_START:
-            bus.enable(MOTOR1_ADDR, True)
-            bus.enable(MOTOR2_ADDR, True)
-    except Exception as e:
-        safe_shutdown()
-        raise RuntimeError(f"Fallo haciendo enable por RS485: {e}") from e
-
-    # ---- Calibración: pitch0 con robot recto ----
-    t_end = time.monotonic() + max(0.2, CALIB_SECONDS)
-    n = 0
-    p0_sum = 0.0
-    while time.monotonic() < t_end:
-        a = imu.get_accel_data()
-        ax = float(a.get("x", 0.0))
-        ay = float(a.get("y", 0.0))
-        az = float(a.get("z", 0.0))
-        p0_sum += accel_to_pitch_deg(ax, ay, az)
-        n += 1
-        time.sleep(0.005)
-    if n == 0:
-        safe_shutdown()
-        raise RuntimeError("Calibración fallida: 0 muestras")
-    pitch0 = p0_sum / n
-
-    print(f"[CAL] pitch0 = {pitch0:+.3f} deg (N={n})")
-    print("[RUN] Inclinación -> velocidad (proporcional). Ctrl+C para parar (0 rpm).")
-    print(f"[CFG] K={K_RPM_PER_DEG:.2f} rpm/deg, deadzone={DEADZONE_DEG:.2f} deg, MAX_RPM={MAX_RPM}, signs=({signs.m1},{signs.m2})")
-
-    # ---- Loop ----
-    dt = 1.0 / LOOP_HZ
-    next_t = time.monotonic()
-    pitch_f = 0.0
-    rpm_prev = 0.0
-
-    log_dt = 1.0 / 20.0
-    log_next = time.monotonic()
+    period = 1.0 / UPDATE_HZ
+    t_next = time.monotonic()
 
     try:
-        while not stop_flag["stop"]:
+        while True:
+            # Bombea eventos (imprescindible en pygame)
+            pygame.event.pump()
+
+            # Lee ejes
+            thr = -joy.get_axis(AXIS_THROTTLE)  # invert típico: arriba suele ser negativo
+            trn = joy.get_axis(AXIS_TURN)
+
+            thr = dz(thr, DEADZONE)
+            trn = dz(trn, DEADZONE)
+
+            thr = clamp(thr, -1.0, 1.0)
+            trn = clamp(trn, -1.0, 1.0)
+
+            mc = mix_differential(thr, trn)
+
+            # Manda F6 a ambos motores
+            send(ser, cmd_speed(ADDR_LEFT, mc.left_rpm, ACC))
+            send(ser, cmd_speed(ADDR_RIGHT, mc.right_rpm, ACC))
+
+            # loop timing
+            t_next += period
             now = time.monotonic()
-            if now < next_t:
-                time.sleep(next_t - now)
-                continue
-            next_t += dt
-
-            a = imu.get_accel_data()
-            ax = float(a.get("x", 0.0))
-            ay = float(a.get("y", 0.0))
-            az = float(a.get("z", 0.0))
-
-            pitch = accel_to_pitch_deg(ax, ay, az) - pitch0
-            pitch_f = lp(pitch_f, pitch, PITCH_LP_ALPHA)
-
-            if abs(pitch_f) < DEADZONE_DEG:
-                rpm_cmd = 0.0
+            sleep_s = t_next - now
+            if sleep_s > 0:
+                time.sleep(sleep_s)
             else:
-                rpm_cmd = K_RPM_PER_DEG * pitch_f
+                # vamos tarde; re-sincroniza
+                t_next = now
 
-            rpm_cmd = clamp(rpm_cmd, -MAX_RPM, MAX_RPM)
-
-            # slew limiter por ciclo
-            dr = rpm_cmd - rpm_prev
-            dr = clamp(dr, -MAX_STEP_RPM_PER_CYCLE, MAX_STEP_RPM_PER_CYCLE)
-            rpm_cmd = rpm_prev + dr
-            rpm_prev = rpm_cmd
-
-            rpm_int = int(round(rpm_cmd))
-
-            # Enviar a ambos motores
-            bus.speed_f6(MOTOR1_ADDR, signs.m1 * rpm_int, acc=F6_ACC)
-            bus.speed_f6(MOTOR2_ADDR, signs.m2 * rpm_int, acc=F6_ACC)
-
-            if now >= log_next:
-                log_next += log_dt
-                print(
-                    f"\rpitch={pitch_f:+7.2f} deg  -> rpm={rpm_int:+5d}  |  "
-                    f"m1={signs.m1*rpm_int:+5d}  m2={signs.m2*rpm_int:+5d}     ",
-                    end="",
-                    flush=True,
-                )
-
+    except KeyboardInterrupt:
+        print("\nCTRL+C -> Parando motores...")
     finally:
-        print("\n[STOP] Parando motores...")
-        safe_shutdown()
-        print("[STOP] Hecho.")
+        # 0 RPM con acc=0 (parada inmediata) y luego disable
+        try:
+            send(ser, cmd_speed(ADDR_LEFT, 0, 0))
+            send(ser, cmd_speed(ADDR_RIGHT, 0, 0))
+            time.sleep(0.05)
+            send(ser, cmd_enable(ADDR_LEFT, False))
+            send(ser, cmd_enable(ADDR_RIGHT, False))
+        except Exception as e:
+            print(f"WARNING: error al parar/disable: {e}", file=sys.stderr)
+
+        try:
+            ser.close()
+        except Exception:
+            pass
+        pygame.quit()
+
+    return 0
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
