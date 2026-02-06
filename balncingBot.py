@@ -17,7 +17,7 @@ ADDR_RIGHT = 0x02
 MAX_RPM = 300
 ACC = 255
 
-DEADZONE = 0.08
+DEADZONE = 0.001
 
 # Para balanceo suele interesar más frecuencia que 50 Hz.
 # Si tu RPi va bien, 100-200 Hz suele ser razonable. Aquí dejo 100 Hz por defecto.
@@ -66,9 +66,9 @@ MAX_SETPOINT_OFFSET_DEG = 10.0
 
 # PID sobre el ángulo (salida en "rpm base")
 # OJO: hay que tunear en tu robot. Empezar con Ki=0 suele ser más seguro.
-Kp = 18.0
+Kp = 10.0
 Ki = 0.0
-Kd = 0.9
+Kd = 1.9
 
 # Limitación integral (anti-windup) en unidades de "rpm equivalente"
 I_LIM = 200.0
@@ -378,7 +378,7 @@ def main() -> int:
 
             # --- Joystick -> setpoint y giro ---
             thr = -joy.get_axis(AXIS_THROTTLE)
-            trn = joy.get_axis(AXIS_TURN)
+            trn = joy.get_axis(AXIS_TURN)/10
 
             thr = clamp(dz(thr, DEADZONE), -1.0, 1.0)
             trn = clamp(dz(trn, DEADZONE), -1.0, 1.0)
