@@ -32,7 +32,7 @@ MPU_ADDR = 0x68  # típico si AD0=0; si AD0=1 -> 0x69
 
 # Registros MPU6050
 REG_PWR_MGMT_1   = 0x6B
-REG_GYRO_XOUT_H  = 0x43  # GX_H=0x43, GX_L=0x44
+REG_GYRO_YOUT_H  = 0x45  # GY_H=0x45, GY_L=0x46
 
 # Sensibilidad típica por defecto (FS_SEL=0 => ±250 dps) => 131 LSB/(°/s)
 GYRO_LSB_PER_DPS = 131.0
@@ -149,15 +149,15 @@ def mpu_wake(bus: SMBus) -> None:
     bus.write_byte_data(MPU_ADDR, REG_PWR_MGMT_1, 0x00)
     time.sleep(0.05)
 
-def calibrate_gyro_x_bias(bus: SMBus) -> float:
+def calibrate_gyro_y_bias(bus: SMBus) -> float:
     """
-    Bias del gyro X en °/s, calculado UNA SOLA VEZ al arranque.
+    Bias del gyro Y en °/s, calculado UNA SOLA VEZ al arranque.
     Sensor quieto durante CAL_SAMPLES.
     """
     s = 0.0
     for _ in range(CAL_SAMPLES):
-        raw_gx = read_i16_be(bus, MPU_ADDR, REG_GYRO_XOUT_H)
-        s += (raw_gx / GYRO_LSB_PER_DPS)
+        raw_gy = read_i16_be(bus, MPU_ADDR, REG_GYRO_YOUT_H)
+        s += (raw_gy / GYRO_LSB_PER_DPS)
         time.sleep(0.001)
     return s / float(CAL_SAMPLES)
 
@@ -176,16 +176,16 @@ def main() -> int:
         return 3
 
     # --- Calibración SOLO AL INICIO ---
-    print("Calibrando gyro X (una sola vez). Mantén el GY-521 quieto...")
+    print("Calibrando gyro Y (una sola vez). Mantén el GY-521 quieto...")
     try:
-        gyro_x_bias_dps = calibrate_gyro_x_bias(bus)
+        gyro_y_bias_dps = calibrate_gyro_y_bias(bus)
     except Exception as e:
-        print(f"ERROR I2C: no se pudo calibrar gyro X: {e}", file=sys.stderr)
+        print(f"ERROR I2C: no se pudo calibrar gyro Y: {e}", file=sys.stderr)
         bus.close()
         return 4
 
-    angle_x_deg = 0.0  # cero sólo al inicio
-    print(f"OK. Bias Gx={gyro_x_bias_dps:.6f} °/s | Ángulo X inicial=0.000 °")
+    angle_y_deg = 0.0  # cero sólo al inicio
+    print(f"OK. Bias Gy={gyro_y_bias_dps:.6f} °/s | Ángulo Y inicial=0.000 °")
 
     # RS485 init
     ser = open_serial()
@@ -224,16 +224,16 @@ def main() -> int:
             if dt < 0:
                 dt = 0.0
             elif dt > DT_MAX:
-                dt = DT_MAX  # evita “saltos” enormes si el loop se bloquea
+                dt = DT_MAX
 
-            # --- Gyro X -> ángulo ---
+            # --- Gyro Y -> ángulo ---
             try:
-                raw_gx = read_i16_be(bus, MPU_ADDR, REG_GYRO_XOUT_H)
-                gx_dps = (raw_gx / GYRO_LSB_PER_DPS) - gyro_x_bias_dps
-                angle_x_deg += gx_dps * dt
+                raw_gy = read_i16_be(bus, MPU_ADDR, REG_GYRO_YOUT_H)
+                gy_dps = (raw_gy / GYRO_LSB_PER_DPS) - gyro_y_bias_dps
+                angle_y_deg += gy_dps * dt
             except Exception as e:
-                print(f"\nWARNING I2C: lectura gyro X falló: {e}", file=sys.stderr)
-                gx_dps = 0.0
+                print(f"\nWARNING I2C: lectura gyro Y falló: {e}", file=sys.stderr)
+                gy_dps = 0.0
 
             # --- Joystick -> diferencial ---
             thr = -joy.get_axis(AXIS_THROTTLE)
@@ -250,7 +250,7 @@ def main() -> int:
 
             # --- Print status (una línea) ---
             sys.stdout.write(
-                f"\rAngX={angle_x_deg:+08.3f} deg | Gx={gx_dps:+07.3f} dps | "
+                f"\rAngY={angle_y_deg:+08.3f} deg | Gy={gy_dps:+07.3f} dps | "
                 f"L={mc.left_rpm:+04d} rpm R={mc.right_rpm:+04d} rpm   "
             )
             sys.stdout.flush()
