@@ -38,7 +38,7 @@ DT_MAX = 0.05
 ANGLE_CUTOFF_DEG = 35.0
 
 # Slew-rate de salida (rpm/s)
-MAX_RPM_STEP_PER_S = 700.0
+MAX_RPM_STEP_PER_S = 400.0
 # =========================================================
 
 # ===================== PID (en realidad PD+gyro) =====================
