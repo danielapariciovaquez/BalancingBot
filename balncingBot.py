@@ -30,7 +30,7 @@ AXIS_THROTTLE = 1
 AXIS_TURN     = 3
 
 # Si un motor está montado invertido, cambia aquí (muy típico en diferencial)
-INVERT_LEFT  = False
+INVERT_LEFT  = True
 INVERT_RIGHT = False
 # ==================================================
 
