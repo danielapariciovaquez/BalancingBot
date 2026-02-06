@@ -17,7 +17,7 @@ ADDR_RIGHT = 0x02
 MAX_RPM = 300
 ACC = 255
 
-BAL_MAX_RPM = 140
+BAL_MAX_RPM = 40
 
 INTER_FRAME_DELAY_S = 0.004
 ENABLE_RETRIES = 2
@@ -28,18 +28,18 @@ INVERT_RIGHT = True
 # ===========================================================
 
 # ===================== CONTROL LOOP =====================
-UPDATE_HZ = 150
+UPDATE_HZ = 200
 DT_MAX = 0.05
 
 ANGLE_CUTOFF_DEG = 35.0
-MAX_RPM_STEP_PER_S = 700.0
+MAX_RPM_STEP_PER_S = 500.0
 # =========================================================
 
 # ===================== CONTROL (PD+gyro) =====================
 PID_INIT_KP = 12.0
 PID_INIT_KI = 0.0
 PID_INIT_KD = 2.2
-I_LIM = 200.0
+I_LIM = 20.0
 # =========================================================
 
 # ===================== MPU6050 (GY-521) =====================
