@@ -14,10 +14,10 @@ ADDR_LEFT  = 0x01
 ADDR_RIGHT = 0x02
 
 # MKS: speed range 0..3000 RPM (12 bits)
-MAX_RPM = 3000
+MAX_RPM = 30
 
 # Aceleración (0..255). OJO: en el manual, acc=0 implica parada inmediata cuando speed=0.
-ACC = 50
+ACC = 255
 
 # Control joystick
 DEADZONE = 0.08
@@ -30,8 +30,8 @@ AXIS_THROTTLE = 1
 AXIS_TURN     = 3
 
 # Si un motor está montado invertido, cambia aquí (muy típico en diferencial)
-INVERT_LEFT  = True
-INVERT_RIGHT = False
+INVERT_LEFT  = False
+INVERT_RIGHT = True
 # ==================================================
 
 def clamp(x: float, lo: float, hi: float) -> float:
