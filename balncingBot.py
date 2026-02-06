@@ -47,7 +47,7 @@ GYRO_LSB_PER_DPS = 131.0
 CAL_SAMPLES_GYRO  = 800
 CAL_SAMPLES_ACCEL = 200
 
-ANGLE_CUTOFF_DEG = 10.0
+ANGLE_CUTOFF_DEG = 30.0
 DT_MAX = 0.05
 # ====================================================================
 
@@ -64,9 +64,9 @@ SETPOINT_DEG = 0.0
 MAX_SETPOINT_OFFSET_DEG = 10.0  # throttle -> inclinación deseada
 
 # Gains más conservadores + más amortiguación
-Kp = 18.0
-Ki = 0.1
-Kd = 1.6
+Kp = 12.0
+Ki = 0
+Kd = 1
 
 # Anti-windup (aunque Ki=0)
 I_LIM = 200.0
