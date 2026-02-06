@@ -3,11 +3,10 @@ import time
 import sys
 import math
 import serial
-import pygame
 import threading
 from dataclasses import dataclass
 
-# ===================== CONFIG (RS485 + JOYSTICK) =====================
+# ===================== RS485 / MOTORES =====================
 PORT = "/dev/ttyUSB0"
 BAUD = 38400
 TIMEOUT_S = 0.05
@@ -15,25 +14,44 @@ TIMEOUT_S = 0.05
 ADDR_LEFT  = 0x01
 ADDR_RIGHT = 0x02
 
-MAX_RPM = 300          # límite absoluto
+MAX_RPM = 300          # límite absoluto del comando F6
 ACC = 255
 
-DEADZONE = 0.08
-UPDATE_HZ = 100
+# Balance output limit (arranca conservador)
+BAL_MAX_RPM = 140
 
-AXIS_THROTTLE = 1
-AXIS_TURN     = 3
+# RS485 pacing / robust enable
+INTER_FRAME_DELAY_S = 0.004
+ENABLE_RETRIES = 2
+ENABLE_RETRY_DELAY_S = 0.02
 
+# Motores montados en sentidos opuestos
 INVERT_LEFT  = False
 INVERT_RIGHT = True
+# ===========================================================
 
-# --- RS485 pacing ---
-INTER_FRAME_DELAY_S = 0.004   # 4 ms entre tramas (ajustable)
-ENABLE_RETRIES = 2            # re-envía enable/disable para robustez (sin leer ACK)
-ENABLE_RETRY_DELAY_S = 0.02   # 20 ms entre reintentos
-# ====================================================================
+# ===================== CONTROL LOOP =====================
+UPDATE_HZ = 150        # recomendado 100-200 Hz
+DT_MAX = 0.05
 
-# ===================== CONFIG (GY-521 / MPU6050) =====================
+# Cutoff si se cae
+ANGLE_CUTOFF_DEG = 35.0
+
+# Slew-rate de salida (rpm/s)
+MAX_RPM_STEP_PER_S = 700.0
+# =========================================================
+
+# ===================== PID (en realidad PD+gyro) =====================
+# u_rpm = Kp*(0 - angle) - Kd*gyro_rate + Ki*integral
+# Recomendación: empezar con Ki=0.
+PID_INIT_KP = 12.0     # rpm/deg
+PID_INIT_KI = 0.0      # rpm/(deg*s)
+PID_INIT_KD = 2.2      # rpm/(deg/s)
+
+I_LIM = 200.0
+# =========================================================
+
+# ===================== MPU6050 (GY-521) =====================
 I2C_BUS = 1
 MPU_ADDR = 0x68
 
@@ -47,46 +65,23 @@ GYRO_LSB_PER_DPS = 131.0
 CAL_SAMPLES_GYRO  = 800
 CAL_SAMPLES_ACCEL = 200
 
-ANGLE_CUTOFF_DEG = 35.0
-DT_MAX = 0.05
-# ====================================================================
-
-# ===================== KALMAN =====================
+# Kalman (suave)
 KAL_Q_ANGLE = 0.0005
 KAL_Q_BIAS  = 0.003
 KAL_R_MEAS  = 0.05
-# ====================================================================
 
-# ===================== BALANCE CONTROL =====================
-SETPOINT_DEG = 0.0
-MAX_SETPOINT_OFFSET_DEG = 10.0
-
-# PID inicial (se podrá ajustar vía web)
-PID_INIT_KP = 10.0
-PID_INIT_KI = 0.0
-PID_INIT_KD = 1.6
-
-I_LIM = 200.0
-
-BAL_MAX_RPM = 120
-
-D_TAU = 0.05
-MAX_RPM_STEP_PER_S = 800.0
-# ====================================================================
-
-# ===================== TURN LIMITS =====================
-TURN_SCALE = 0.20
-TURN_MAX_RPM = 60
-# ====================================================================
+# Si el gyro sale con signo opuesto al accel en tu montaje:
+INVERT_GYRO_RATE = False
+# ===========================================================
 
 # ===================== WEB UI =====================
 WEB_HOST = "0.0.0.0"
 WEB_PORT = 8000
-# Rango sliders
-KP_RANGE = (0.0, 60.0)
-KI_RANGE = (0.0, 20.0)
-KD_RANGE = (0.0, 20.0)
-# ====================================================================
+
+KP_RANGE = (0.0, 80.0)
+KI_RANGE = (0.0, 50.0)
+KD_RANGE = (0.0, 30.0)
+# ===========================================================
 
 # --- I2C backend (smbus2 preferente, si no smbus) ---
 try:
@@ -106,9 +101,6 @@ except ImportError:
 
 def clamp(x: float, lo: float, hi: float) -> float:
     return lo if x < lo else hi if x > hi else x
-
-def dz(x: float, dead: float) -> float:
-    return 0.0 if abs(x) < dead else x
 
 def checksum8(data: bytes) -> int:
     return sum(data) & 0xFF
@@ -172,18 +164,11 @@ def send_enable_robust(ser: serial.Serial, addr: int, en: bool) -> None:
 
 def i2c_require():
     if SMBus is None:
-        raise RuntimeError(
-            "No se encontró smbus2/smbus. Instala:\n"
-            "  pip3 install smbus2\n"
-            "y habilita i2c (raspi-config) + permisos /dev/i2c-1."
-        )
+        raise RuntimeError("Falta smbus2/smbus. Instala: pip3 install smbus2")
 
 def web_require():
     if Flask is None:
-        raise RuntimeError(
-            "No se encontró Flask. Instala:\n"
-            "  pip3 install flask\n"
-        )
+        raise RuntimeError("Falta Flask. Instala: pip3 install flask")
 
 def read_i16_be(bus: SMBus, addr: int, reg_hi: int) -> int:
     hi = bus.read_byte_data(addr, reg_hi)
@@ -204,11 +189,14 @@ def read_accel_gyro(bus: SMBus):
     return ax, az, gy
 
 def accel_angle_deg_from_ax_az(ax_raw: int, az_raw: int) -> float:
-    # forward tilt => decrement
+    """
+    Pitch from AX/AZ.
+    Requisito: inclinar hacia delante => ángulo decrementa.
+    """
     ax_g = ax_raw / ACC_LSB_PER_G
     az_g = az_raw / ACC_LSB_PER_G
     ang = math.degrees(math.atan2(ax_g, az_g))
-    return -ang
+    return -ang  # forward tilt => decrement
 
 class Kalman1D:
     def __init__(self, q_angle=KAL_Q_ANGLE, q_bias=KAL_Q_BIAS, r_measure=KAL_R_MEAS):
@@ -266,9 +254,9 @@ def calibrate_accel_angle_zero(bus: SMBus) -> float:
         time.sleep(0.001)
     return s / float(CAL_SAMPLES_ACCEL)
 
-def motors_from_balance(base_rpm: float, turn_rpm: float) -> MotorCmd:
-    left = base_rpm - turn_rpm
-    right = base_rpm + turn_rpm
+def motors_from_balance(base_rpm: float) -> MotorCmd:
+    left = base_rpm
+    right = base_rpm
 
     left_rpm = int(round(clamp(left, -MAX_RPM, MAX_RPM)))
     right_rpm = int(round(clamp(right, -MAX_RPM, MAX_RPM)))
@@ -313,7 +301,7 @@ def start_web_server():
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>PID Self-Balancing</title>
   <style>
-    body {{ font-family: sans-serif; margin: 20px; max-width: 720px; }}
+    body {{ font-family: sans-serif; margin: 20px; max-width: 780px; }}
     .row {{ margin: 18px 0; }}
     .label {{ display:flex; justify-content:space-between; margin-bottom: 6px; }}
     input[type=range] {{ width: 100%; }}
@@ -338,15 +326,15 @@ def start_web_server():
       <input id="kd" type="range" min="{KD_RANGE[0]}" max="{KD_RANGE[1]}" step="0.1">
     </div>
     <div class="small">
-      Actualiza en caliente vía <code>/pid</code>. Si pierdes conexión, el robot sigue con el último PID.
+      Consejo: empieza con <code>Ki=0</code>. Ajusta <code>Kp</code> (levanta) y luego <code>Kd</code> (amortigua).
+      <br/>API: <code>GET/POST /pid</code>.
     </div>
   </div>
 
 <script>
 async function getPID() {{
   const r = await fetch('/pid');
-  const j = await r.json();
-  return j;
+  return await r.json();
 }}
 
 async function setPID(kp,ki,kd) {{
@@ -367,7 +355,6 @@ function bindSlider(id, labId, fmt) {{
 
 (async () => {{
   const pid = await getPID();
-
   const kp = bindSlider('kp','kpv',v=>v.toFixed(1));
   const ki = bindSlider('ki','kiv',v=>v.toFixed(2));
   const kd = bindSlider('kd','kdv',v=>v.toFixed(1));
@@ -381,7 +368,7 @@ function bindSlider(id, labId, fmt) {{
     clearTimeout(t);
     t = setTimeout(() => {{
       setPID(parseFloat(kp.slider.value), parseFloat(ki.slider.value), parseFloat(kd.slider.value));
-    }}, 120); // debounce
+    }}, 120);
   }};
 
   kp.slider.addEventListener('input', push);
@@ -424,13 +411,13 @@ function bindSlider(id, labId, fmt) {{
 def main() -> int:
     i2c_require()
     if Flask is None:
-        print("WARNING: Flask no instalado -> sin interfaz web. (pip3 install flask)", file=sys.stderr)
+        print("ERROR: Flask no instalado. Instala: pip3 install flask", file=sys.stderr)
+        return 1
 
-    # Arranca web en hilo aparte si Flask existe
-    if Flask is not None:
-        th = threading.Thread(target=start_web_server, daemon=True)
-        th.start()
-        print(f"Web PID en http://<IP_RPI>:{WEB_PORT}/")
+    # Arranca web en hilo aparte
+    th = threading.Thread(target=start_web_server, daemon=True)
+    th.start()
+    print(f"Web PID: http://<IP_RPI>:{WEB_PORT}/")
 
     bus = SMBus(I2C_BUS)
     try:
@@ -455,27 +442,11 @@ def main() -> int:
 
     ser = open_serial()
 
-    pygame.init()
-    pygame.joystick.init()
-
-    if pygame.joystick.get_count() < 1:
-        print("ERROR: no hay joystick detectado por pygame.")
-        ser.close()
-        bus.close()
-        return 2
-
-    joy = pygame.joystick.Joystick(0)
-    joy.init()
-    print(f"Joystick: {joy.get_name()} | axes={joy.get_numaxes()} buttons={joy.get_numbuttons()}")
-
-    # --- ENABLE robusto con separación y reintentos ---
+    # Enable robusto con separación y reintentos
     send_enable_robust(ser, ADDR_LEFT, True)
     send_enable_robust(ser, ADDR_RIGHT, True)
 
-    # PID states
     integ = 0.0
-    prev_err = 0.0
-    d_filt = 0.0
     base_rpm_cmd = 0.0
 
     period = 1.0 / UPDATE_HZ
@@ -484,8 +455,6 @@ def main() -> int:
 
     try:
         while True:
-            pygame.event.pump()
-
             now = time.monotonic()
             dt = now - t_prev
             t_prev = now
@@ -499,8 +468,8 @@ def main() -> int:
                 ax, az, gy_raw = read_accel_gyro(bus)
                 accel_angle = accel_angle_deg_from_ax_az(ax, az) - accel_zero_deg
                 gyro_rate = (gy_raw / GYRO_LSB_PER_DPS) - gyro_y_bias_dps
-                # Si gyro tiene signo opuesto al accel en tu montaje:
-                # gyro_rate = -gyro_rate
+                if INVERT_GYRO_RATE:
+                    gyro_rate = -gyro_rate
                 angle = kf.update(accel_angle, gyro_rate, dt)
             except Exception as e:
                 print(f"\nWARNING I2C: lectura IMU falló: {e}", file=sys.stderr)
@@ -513,8 +482,6 @@ def main() -> int:
                 send_paced(ser, cmd_speed(ADDR_LEFT, 0, 0))
                 send_paced(ser, cmd_speed(ADDR_RIGHT, 0, 0))
                 integ = 0.0
-                prev_err = 0.0
-                d_filt = 0.0
                 base_rpm_cmd = 0.0
                 sys.stdout.write(f"\rCAIDO: Ang={angle:+07.2f} deg -> motores 0 rpm                           ")
                 sys.stdout.flush()
@@ -527,54 +494,37 @@ def main() -> int:
                     t_next = time.monotonic()
                 continue
 
-            # Joystick -> setpoint + turn
-            thr = -joy.get_axis(AXIS_THROTTLE)
-            trn = joy.get_axis(AXIS_TURN)
-            thr = clamp(dz(thr, DEADZONE), -1.0, 1.0)
-            trn = clamp(dz(trn, DEADZONE), -1.0, 1.0)
-
-            setpoint = SETPOINT_DEG + thr * MAX_SETPOINT_OFFSET_DEG
-
-            # Giro MUY limitado
-            trn = clamp(trn * TURN_SCALE, -1.0, 1.0)
-            turn_rpm = clamp(trn * MAX_RPM, -TURN_MAX_RPM, +TURN_MAX_RPM)
-
-            # PID gains desde web
+            # PID params desde web
             kp, ki, kd = get_pid()
 
-            # PID
-            err = setpoint - angle
+            # Error con setpoint=0
+            err = 0.0 - angle
 
+            # Integral opcional (por defecto Ki=0)
             integ += err * dt
             integ = clamp(integ, -I_LIM, I_LIM)
 
-            derr = (err - prev_err) / dt if dt > 0 else 0.0
-            prev_err = err
-
-            alpha = dt / (D_TAU + dt)
-            d_filt += alpha * (derr - d_filt)
-
-            base_rpm = (kp * err) + (ki * integ) + (kd * d_filt)
+            # Control PD con gyro directo (amortiguación real)
+            base_rpm = (kp * err) - (kd * gyro_rate) + (ki * integ)
             base_rpm = clamp(base_rpm, -BAL_MAX_RPM, +BAL_MAX_RPM)
 
-            # Slew-rate
+            # Slew-rate (anti latigazo)
             max_step = MAX_RPM_STEP_PER_S * dt
             delta = clamp(base_rpm - base_rpm_cmd, -max_step, +max_step)
             base_rpm_cmd += delta
             base_rpm_cmd = clamp(base_rpm_cmd, -BAL_MAX_RPM, +BAL_MAX_RPM)
 
-            mc = motors_from_balance(base_rpm_cmd, turn_rpm)
+            mc = motors_from_balance(base_rpm_cmd)
 
-            # RS485 send con separación entre tramas
+            # RS485 send con separación
             send_paced(ser, cmd_speed(ADDR_LEFT, mc.left_rpm, ACC))
             send_paced(ser, cmd_speed(ADDR_RIGHT, mc.right_rpm, ACC))
 
-            # Debug
+            # Debug (una línea)
             sys.stdout.write(
                 f"\rAng={angle:+07.2f} | Acc={accel_angle:+07.2f} | Gy={gyro_rate:+07.2f} dps | "
-                f"SP={setpoint:+06.2f} | PID(kp={kp:4.1f},ki={ki:4.2f},kd={kd:4.1f}) | "
-                f"base={base_rpm_cmd:+06.1f} | turn={turn_rpm:+06.1f} | "
-                f"L={mc.left_rpm:+04d} R={mc.right_rpm:+04d}     "
+                f"PID(kp={kp:5.1f},ki={ki:5.2f},kd={kd:5.1f}) | "
+                f"base={base_rpm_cmd:+06.1f} | L={mc.left_rpm:+04d} R={mc.right_rpm:+04d}     "
             )
             sys.stdout.flush()
 
@@ -594,7 +544,6 @@ def main() -> int:
             send_paced(ser, cmd_speed(ADDR_LEFT, 0, 0))
             send_paced(ser, cmd_speed(ADDR_RIGHT, 0, 0))
             time.sleep(0.05)
-            # DISABLE robusto
             send_enable_robust(ser, ADDR_LEFT, False)
             send_enable_robust(ser, ADDR_RIGHT, False)
         except Exception as e:
@@ -608,7 +557,6 @@ def main() -> int:
             bus.close()
         except Exception:
             pass
-        pygame.quit()
 
     return 0
 
