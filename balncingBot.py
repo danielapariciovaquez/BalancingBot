@@ -64,9 +64,9 @@ SETPOINT_DEG = 0.0
 MAX_SETPOINT_OFFSET_DEG = 10.0  # throttle -> inclinación deseada
 
 # Gains más conservadores + más amortiguación
-Kp = 5
+Kp = 1
 Ki = 0
-Kd = 1
+Kd = 0
 
 # Anti-windup (aunque Ki=0)
 I_LIM = 200.0
