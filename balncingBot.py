@@ -18,7 +18,7 @@ MAX_RPM = 300          # límite absoluto del comando F6
 ACC = 255
 
 # Balance output limit (arranca conservador)
-BAL_MAX_RPM = 100
+BAL_MAX_RPM = 80
 
 # RS485 pacing / robust enable
 INTER_FRAME_DELAY_S = 0.004
