@@ -18,7 +18,7 @@ MAX_RPM = 300          # límite absoluto del comando F6
 ACC = 255
 
 # Balance output limit (arranca conservador)
-BAL_MAX_RPM = 80
+BAL_MAX_RPM = 20
 
 # RS485 pacing / robust enable
 INTER_FRAME_DELAY_S = 0.004
@@ -31,14 +31,14 @@ INVERT_RIGHT = True
 # ===========================================================
 
 # ===================== CONTROL LOOP =====================
-UPDATE_HZ = 150        # recomendado 100-200 Hz
+UPDATE_HZ = 100        # recomendado 100-200 Hz
 DT_MAX = 0.05
 
 # Cutoff si se cae
 ANGLE_CUTOFF_DEG = 35.0
 
 # Slew-rate de salida (rpm/s)
-MAX_RPM_STEP_PER_S = 400.0
+MAX_RPM_STEP_PER_S = 200.0
 # =========================================================
 
 # ===================== PID (en realidad PD+gyro) =====================
