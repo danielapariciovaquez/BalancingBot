@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import time
 import sys
+import math
 import serial
 import pygame
 from dataclasses import dataclass
@@ -13,12 +14,16 @@ TIMEOUT_S = 0.05
 ADDR_LEFT  = 0x01
 ADDR_RIGHT = 0x02
 
-MAX_RPM = 30
+MAX_RPM = 300
 ACC = 255
 
 DEADZONE = 0.08
-UPDATE_HZ = 50
 
+# Para balanceo suele interesar más frecuencia que 50 Hz.
+# Si tu RPi va bien, 100-200 Hz suele ser razonable. Aquí dejo 100 Hz por defecto.
+UPDATE_HZ = 100
+
+# Joystick (tus valores memorizados)
 AXIS_THROTTLE = 1
 AXIS_TURN     = 3
 
@@ -28,20 +33,45 @@ INVERT_RIGHT = True
 
 # ===================== CONFIG (GY-521 / MPU6050) =====================
 I2C_BUS = 1
-MPU_ADDR = 0x68  # típico si AD0=0; si AD0=1 -> 0x69
+MPU_ADDR = 0x68  # AD0=0 típico; si AD0=1 -> 0x69
 
-# Registros MPU6050
+# Registros
 REG_PWR_MGMT_1   = 0x6B
+REG_ACCEL_XOUT_H = 0x3B  # AX_H..AZ_L son 0x3B..0x40
 REG_GYRO_YOUT_H  = 0x45  # GY_H=0x45, GY_L=0x46
 
-# Sensibilidad típica por defecto (FS_SEL=0 => ±250 dps) => 131 LSB/(°/s)
+# Escalas por defecto típicas si no configuras rangos:
+# Accel ±2g => 16384 LSB/g
+# Gyro  ±250 dps => 131 LSB/(°/s)
+ACC_LSB_PER_G = 16384.0
 GYRO_LSB_PER_DPS = 131.0
 
-# Calibración bias al arranque
-CAL_SAMPLES = 500
+# Calibraciones al arranque (sensor quieto y robot en posición vertical de equilibrio)
+CAL_SAMPLES_GYRO = 800
+CAL_SAMPLES_ACCEL = 200
 
-# Protección contra jitter (si el loop se bloquea, evita integrar dt enorme)
-DT_MAX = 0.1  # s
+# Seguridad
+ANGLE_CUTOFF_DEG = 35.0  # si se cae más allá, corta salida de motor
+DT_MAX = 0.05            # clamp dt para evitar integraciones gigantes por jitter
+# ====================================================================
+
+# ===================== BALANCE CONTROL =====================
+# Setpoint de equilibrio (0 deg tras calibrar)
+SETPOINT_DEG = 0.0
+
+# Joystick -> setpoint (lean-to-go)
+# throttle [-1..1] se convierte a offset de setpoint (grados).
+# AJUSTA este límite según tu mecánica; no hay valor universal.
+MAX_SETPOINT_OFFSET_DEG = 10.0
+
+# PID sobre el ángulo (salida en "rpm base")
+# OJO: hay que tunear en tu robot. Empezar con Ki=0 suele ser más seguro.
+Kp = 18.0
+Ki = 0.0
+Kd = 0.9
+
+# Limitación integral (anti-windup) en unidades de "rpm equivalente"
+I_LIM = 200.0
 # ====================================================================
 
 # --- I2C backend (smbus2 preferente, si no smbus) ---
@@ -90,24 +120,6 @@ class MotorCmd:
     left_rpm: int
     right_rpm: int
 
-def mix_differential(throttle: float, turn: float) -> MotorCmd:
-    left  = throttle - turn
-    right = throttle + turn
-
-    m = max(1.0, abs(left), abs(right))
-    left /= m
-    right /= m
-
-    left_rpm = int(round(left * MAX_RPM))
-    right_rpm = int(round(right * MAX_RPM))
-
-    if INVERT_LEFT:
-        left_rpm = -left_rpm
-    if INVERT_RIGHT:
-        right_rpm = -right_rpm
-
-    return MotorCmd(left_rpm=left_rpm, right_rpm=right_rpm)
-
 def open_serial() -> serial.Serial:
     ser = serial.Serial(
         port=PORT,
@@ -126,8 +138,6 @@ def send(ser: serial.Serial, data: bytes) -> None:
     ser.write(data)
     ser.flush()
 
-# ===================== MPU6050 helpers =====================
-
 def i2c_require():
     if SMBus is None:
         raise RuntimeError(
@@ -145,23 +155,115 @@ def read_i16_be(bus: SMBus, addr: int, reg_hi: int) -> int:
     return v
 
 def mpu_wake(bus: SMBus) -> None:
-    # Mínimo: salir de sleep
     bus.write_byte_data(MPU_ADDR, REG_PWR_MGMT_1, 0x00)
     time.sleep(0.05)
 
-def calibrate_gyro_y_bias(bus: SMBus) -> float:
+def read_accel_gyro(bus: SMBus):
+    # Accel X,Z y Gyro Y
+    ax = read_i16_be(bus, MPU_ADDR, REG_ACCEL_XOUT_H)       # 0x3B
+    # ay = read_i16_be(bus, MPU_ADDR, REG_ACCEL_XOUT_H + 2)  # 0x3D (no usado)
+    az = read_i16_be(bus, MPU_ADDR, REG_ACCEL_XOUT_H + 4)   # 0x3F
+    gy = read_i16_be(bus, MPU_ADDR, REG_GYRO_YOUT_H)        # 0x45
+    return ax, az, gy
+
+def accel_angle_deg_from_ax_az(ax_raw: int, az_raw: int) -> float:
     """
-    Bias del gyro Y en °/s, calculado UNA SOLA VEZ al arranque.
-    Sensor quieto durante CAL_SAMPLES.
+    Ángulo de pitch derivado de acelerómetro usando AX y AZ.
+    El resultado depende de cómo esté orientado tu módulo.
+    Aquí usamos atan2(ax, az).
+    REQUISITO tuyo: al inclinar hacia adelante, el ángulo DECREMENTA.
+    Para imponerlo, invertimos el signo.
+    """
+    ax_g = ax_raw / ACC_LSB_PER_G
+    az_g = az_raw / ACC_LSB_PER_G
+    ang = math.degrees(math.atan2(ax_g, az_g))
+    return -ang  # <-- fuerza: forward tilt => ángulo decrece
+
+class Kalman1D:
+    """
+    Kalman 1D típico para ángulo con bias de gyro:
+      state: [angle, bias]
+      input: gyro_rate (deg/s)
+      measurement: accel_angle (deg)
+    """
+    def __init__(self, q_angle=0.001, q_bias=0.003, r_measure=0.03):
+        self.q_angle = float(q_angle)
+        self.q_bias = float(q_bias)
+        self.r_measure = float(r_measure)
+
+        self.angle = 0.0
+        self.bias = 0.0
+        self.P00 = 1.0
+        self.P01 = 0.0
+        self.P10 = 0.0
+        self.P11 = 1.0
+
+    def set_angle(self, angle_deg: float):
+        self.angle = float(angle_deg)
+
+    def update(self, meas_angle_deg: float, gyro_rate_dps: float, dt: float) -> float:
+        # Predict
+        rate = gyro_rate_dps - self.bias
+        self.angle += dt * rate
+
+        # Covariance predict
+        P00 = self.P00 + dt * (dt*self.P11 - self.P01 - self.P10 + self.q_angle)
+        P01 = self.P01 - dt * self.P11
+        P10 = self.P10 - dt * self.P11
+        P11 = self.P11 + self.q_bias * dt
+
+        self.P00, self.P01, self.P10, self.P11 = P00, P01, P10, P11
+
+        # Update
+        y = meas_angle_deg - self.angle
+        S = self.P00 + self.r_measure
+        K0 = self.P00 / S
+        K1 = self.P10 / S
+
+        self.angle += K0 * y
+        self.bias  += K1 * y
+
+        P00 = self.P00 - K0 * self.P00
+        P01 = self.P01 - K0 * self.P01
+        P10 = self.P10 - K1 * self.P00
+        P11 = self.P11 - K1 * self.P01
+
+        self.P00, self.P01, self.P10, self.P11 = P00, P01, P10, P11
+        return self.angle
+
+def calibrate_gyro_y_bias(bus: SMBus) -> float:
+    s = 0.0
+    for _ in range(CAL_SAMPLES_GYRO):
+        _, _, gy_raw = read_accel_gyro(bus)
+        s += (gy_raw / GYRO_LSB_PER_DPS)
+        time.sleep(0.001)
+    return s / float(CAL_SAMPLES_GYRO)
+
+def calibrate_accel_angle_zero(bus: SMBus) -> float:
+    """
+    Promedia el ángulo del acelerómetro en la posición inicial.
+    Se usa como offset para que el ángulo inicial sea 0 deg.
     """
     s = 0.0
-    for _ in range(CAL_SAMPLES):
-        raw_gy = read_i16_be(bus, MPU_ADDR, REG_GYRO_YOUT_H)
-        s += (raw_gy / GYRO_LSB_PER_DPS)
+    for _ in range(CAL_SAMPLES_ACCEL):
+        ax, az, _ = read_accel_gyro(bus)
+        s += accel_angle_deg_from_ax_az(ax, az)
         time.sleep(0.001)
-    return s / float(CAL_SAMPLES)
+    return s / float(CAL_SAMPLES_ACCEL)
 
-# ===================== main =====================
+def motors_from_balance(base_rpm: float, turn_rpm: float) -> MotorCmd:
+    left = base_rpm - turn_rpm
+    right = base_rpm + turn_rpm
+
+    left_rpm = int(round(clamp(left, -MAX_RPM, MAX_RPM)))
+    right_rpm = int(round(clamp(right, -MAX_RPM, MAX_RPM)))
+
+    if INVERT_LEFT:
+        left_rpm = -left_rpm
+    if INVERT_RIGHT:
+        right_rpm = -right_rpm
+
+    return MotorCmd(left_rpm=left_rpm, right_rpm=right_rpm)
 
 def main() -> int:
     i2c_require()
@@ -175,17 +277,20 @@ def main() -> int:
         bus.close()
         return 3
 
-    # --- Calibración SOLO AL INICIO ---
-    print("Calibrando gyro Y (una sola vez). Mantén el GY-521 quieto...")
+    print("Calibrando IMU (quieto y en posición de equilibrio)...")
     try:
         gyro_y_bias_dps = calibrate_gyro_y_bias(bus)
+        accel_zero_deg = calibrate_accel_angle_zero(bus)
     except Exception as e:
-        print(f"ERROR I2C: no se pudo calibrar gyro Y: {e}", file=sys.stderr)
+        print(f"ERROR I2C: calibración falló: {e}", file=sys.stderr)
         bus.close()
         return 4
 
-    angle_y_deg = 0.0  # cero sólo al inicio
-    print(f"OK. Bias Gy={gyro_y_bias_dps:.6f} °/s | Ángulo Y inicial=0.000 °")
+    # Kalman init: arrancamos el ángulo en 0 tras compensar offset
+    kf = Kalman1D()
+    kf.set_angle(0.0)
+
+    print(f"OK. Bias Gy={gyro_y_bias_dps:.6f} °/s | AccelZero={accel_zero_deg:.6f} ° | Ang inicial=0.000°")
 
     # RS485 init
     ser = open_serial()
@@ -209,7 +314,10 @@ def main() -> int:
     send(ser, cmd_enable(ADDR_RIGHT, True))
     time.sleep(0.05)
 
-    # Timing
+    # PID state
+    integ = 0.0
+    prev_err = 0.0
+
     period = 1.0 / UPDATE_HZ
     t_next = time.monotonic()
     t_prev = t_next
@@ -221,41 +329,92 @@ def main() -> int:
             now = time.monotonic()
             dt = now - t_prev
             t_prev = now
-            if dt < 0:
+            if dt < 0.0:
                 dt = 0.0
             elif dt > DT_MAX:
                 dt = DT_MAX
 
-            # --- Gyro Y -> ángulo ---
+            # --- IMU read ---
             try:
-                raw_gy = read_i16_be(bus, MPU_ADDR, REG_GYRO_YOUT_H)
-                gy_dps = (raw_gy / GYRO_LSB_PER_DPS) - gyro_y_bias_dps
-                angle_y_deg += gy_dps * dt
-            except Exception as e:
-                print(f"\nWARNING I2C: lectura gyro Y falló: {e}", file=sys.stderr)
-                gy_dps = 0.0
+                ax, az, gy_raw = read_accel_gyro(bus)
+                accel_angle = accel_angle_deg_from_ax_az(ax, az) - accel_zero_deg
 
-            # --- Joystick -> diferencial ---
+                # gyro rate (deg/s), usando eje Y
+                gyro_rate = (gy_raw / GYRO_LSB_PER_DPS) - gyro_y_bias_dps
+
+                # coherencia de signo: si forward tilt => angle decrece.
+                # Ya lo impusimos en accel_angle; el gyro debe seguir el mismo convenio.
+                # Si al inclinar hacia adelante el gyro_rate sale con signo contrario al accel,
+                # invierte aquí: gyro_rate = -gyro_rate
+                # (lo dejamos como está por defecto; se corrige con una sola inversión si hiciera falta)
+
+                angle = kf.update(accel_angle, gyro_rate, dt)
+
+            except Exception as e:
+                print(f"\nWARNING I2C: lectura IMU falló: {e}", file=sys.stderr)
+                angle = kf.angle
+                gyro_rate = 0.0
+                accel_angle = 0.0
+
+            # --- Safety cutoff ---
+            if abs(angle) > ANGLE_CUTOFF_DEG:
+                # Cae: corta mando a 0 hasta que el ángulo vuelva dentro de rango
+                mc = MotorCmd(0, 0)
+                send(ser, cmd_speed(ADDR_LEFT, 0, 0))
+                send(ser, cmd_speed(ADDR_RIGHT, 0, 0))
+                sys.stdout.write(f"\rCAIDO: Ang={angle:+07.2f} deg (cutoff) -> motores 0 rpm                 ")
+                sys.stdout.flush()
+                # sigue loop sin integrar PID (evita windup)
+                integ = 0.0
+                prev_err = 0.0
+                # timing
+                t_next += period
+                sleep_s = t_next - time.monotonic()
+                if sleep_s > 0:
+                    time.sleep(sleep_s)
+                else:
+                    t_next = time.monotonic()
+                continue
+
+            # --- Joystick -> setpoint y giro ---
             thr = -joy.get_axis(AXIS_THROTTLE)
             trn = joy.get_axis(AXIS_TURN)
 
             thr = clamp(dz(thr, DEADZONE), -1.0, 1.0)
             trn = clamp(dz(trn, DEADZONE), -1.0, 1.0)
 
-            mc = mix_differential(thr, trn)
+            setpoint = SETPOINT_DEG + thr * MAX_SETPOINT_OFFSET_DEG
+
+            # --- PID balance -> base rpm ---
+            err = setpoint - angle
+
+            # Integral (anti-windup)
+            integ += err * dt
+            integ = clamp(integ, -I_LIM, I_LIM)
+
+            derr = (err - prev_err) / dt if dt > 0 else 0.0
+            prev_err = err
+
+            # Salida PID en rpm (escala directa por gains)
+            base_rpm = (Kp * err) + (Ki * integ) + (Kd * derr)
+            base_rpm = clamp(base_rpm, -MAX_RPM, MAX_RPM)
+
+            # Turn: lo aplicamos como diferencial en rpm
+            turn_rpm = trn * MAX_RPM
+            mc = motors_from_balance(base_rpm, turn_rpm)
 
             # --- RS485 send ---
             send(ser, cmd_speed(ADDR_LEFT, mc.left_rpm, ACC))
             send(ser, cmd_speed(ADDR_RIGHT, mc.right_rpm, ACC))
 
-            # --- Print status (una línea) ---
+            # --- Print status ---
             sys.stdout.write(
-                f"\rAngY={angle_y_deg:+08.3f} deg | Gy={gy_dps:+07.3f} dps | "
-                f"L={mc.left_rpm:+04d} rpm R={mc.right_rpm:+04d} rpm   "
+                f"\rAng={angle:+07.2f} deg | Acc={accel_angle:+07.2f} | Gy={gyro_rate:+07.2f} dps | "
+                f"SP={setpoint:+06.2f} | base={base_rpm:+06.1f} | L={mc.left_rpm:+04d} R={mc.right_rpm:+04d}    "
             )
             sys.stdout.flush()
 
-            # Loop timing
+            # timing
             t_next += period
             sleep_s = t_next - time.monotonic()
             if sleep_s > 0:
