@@ -66,7 +66,7 @@ MAX_SETPOINT_OFFSET_DEG = 10.0
 
 # PID sobre el ángulo (salida en "rpm base")
 # OJO: hay que tunear en tu robot. Empezar con Ki=0 suele ser más seguro.
-Kp = 5.0
+Kp = 8.0
 Ki = 0.0
 Kd = 0.9
 
