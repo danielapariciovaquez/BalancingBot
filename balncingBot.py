@@ -14,10 +14,10 @@ TIMEOUT_S = 0.05
 ADDR_LEFT  = 0x01
 ADDR_RIGHT = 0x02
 
-MAX_RPM = 300
+MAX_RPM = 10
 ACC = 255
 
-DEADZONE = 0.08
+DEADZONE = 0.01
 
 # Para balanceo suele interesar más frecuencia que 50 Hz.
 # Si tu RPi va bien, 100-200 Hz suele ser razonable. Aquí dejo 100 Hz por defecto.
@@ -67,7 +67,7 @@ MAX_SETPOINT_OFFSET_DEG = 10.0
 # PID sobre el ángulo (salida en "rpm base")
 # OJO: hay que tunear en tu robot. Empezar con Ki=0 suele ser más seguro.
 Kp = 10.0
-Ki = 0.2
+Ki = 0.5
 Kd = 0.8
 
 # Limitación integral (anti-windup) en unidades de "rpm equivalente"
