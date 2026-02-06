@@ -15,9 +15,9 @@ ADDR_LEFT  = 0x01
 ADDR_RIGHT = 0x02
 
 MAX_RPM = 300
-ACC = 245
+ACC = 255
 
-BAL_MAX_RPM = 40
+BAL_MAX_RPM = 120
 
 INTER_FRAME_DELAY_S = 0.004
 ENABLE_RETRIES = 2
@@ -28,18 +28,19 @@ INVERT_RIGHT = True
 # ===========================================================
 
 # ===================== CONTROL LOOP =====================
-UPDATE_HZ = 50
+UPDATE_HZ = 150
 DT_MAX = 0.05
 
-ANGLE_CUTOFF_DEG = 40.0
-MAX_RPM_STEP_PER_S = 500.0
+ANGLE_CUTOFF_DEG = 35.0
+MAX_RPM_STEP_PER_S = 700.0
 # =========================================================
 
 # ===================== CONTROL (PD+gyro) =====================
-PID_INIT_KP = 1
+PID_INIT_KP = 12.0
 PID_INIT_KI = 0.0
-PID_INIT_KD = 0
-I_LIM = 20.0
+PID_INIT_KD = 0.8     # ahora más razonable de partida
+
+I_LIM = 200.0
 # =========================================================
 
 # ===================== MPU6050 (GY-521) =====================
@@ -56,13 +57,14 @@ GYRO_LSB_PER_DPS = 131.0
 CAL_SAMPLES_GYRO  = 800
 CAL_SAMPLES_ACCEL = 200
 
-# Si el gyro sale con signo opuesto al accel en tu montaje:
 INVERT_GYRO_RATE = False
 
 # ===== Filtro complementario =====
-# alpha cercano a 1: confías más en gyro (menos ruido) pero más deriva
-# alpha más bajo: más accel (más ruido) pero menos deriva
 COMP_ALPHA = 0.985
+
+# ===== Filtro D (gyro rate) =====
+GYRO_TAU = 0.03          # s (LPF sobre gyro)
+D_DEADBAND_DPS = 1.5     # deg/s (zona muerta para D)
 # ===========================================================
 
 # ===================== WEB UI =====================
@@ -70,8 +72,8 @@ WEB_HOST = "0.0.0.0"
 WEB_PORT = 8000
 
 KP_RANGE = (0.0, 80.0)
-KI_RANGE = (0.0, 50.0)
-KD_RANGE = (0.0, 30.0)
+KI_RANGE = (0.0, 10.0)
+KD_RANGE = (0.0, 5.0)   # <<<<<< rango reducido para evitar "hipersensibilidad"
 # ===========================================================
 
 try:
@@ -178,14 +180,10 @@ def read_accel_gyro(bus: SMBus):
     return ax, az, gy
 
 def accel_angle_deg_from_ax_az(ax_raw: int, az_raw: int) -> float:
-    """
-    Pitch from AX/AZ.
-    Requisito: inclinar hacia delante => ángulo decrementa.
-    """
     ax_g = ax_raw / ACC_LSB_PER_G
     az_g = az_raw / ACC_LSB_PER_G
     ang = math.degrees(math.atan2(ax_g, az_g))
-    return -ang
+    return -ang  # forward tilt => decrement
 
 def calibrate_gyro_y_bias(bus: SMBus) -> float:
     s = 0.0
@@ -204,11 +202,8 @@ def calibrate_accel_angle_zero(bus: SMBus) -> float:
     return s / float(CAL_SAMPLES_ACCEL)
 
 def motors_from_balance(base_rpm: float) -> MotorCmd:
-    left = base_rpm
-    right = base_rpm
-
-    left_rpm = int(round(clamp(left, -MAX_RPM, MAX_RPM)))
-    right_rpm = int(round(clamp(right, -MAX_RPM, MAX_RPM)))
+    left_rpm = int(round(clamp(base_rpm, -MAX_RPM, MAX_RPM)))
+    right_rpm = int(round(clamp(base_rpm, -MAX_RPM, MAX_RPM)))
 
     if INVERT_LEFT:
         left_rpm = -left_rpm
@@ -272,10 +267,11 @@ def start_web_server():
     </div>
     <div class="row">
       <div class="label"><b>Kd</b><span id="kdv"></span></div>
-      <input id="kd" type="range" min="{KD_RANGE[0]}" max="{KD_RANGE[1]}" step="0.1">
+      <input id="kd" type="range" min="{KD_RANGE[0]}" max="{KD_RANGE[1]}" step="0.05">
     </div>
     <div class="small">
-      Filtro: <code>Complementario</code> (α={COMP_ALPHA}). Consejo: empieza con <code>Ki=0</code>.
+      Complementario α={COMP_ALPHA}. D usa gyro filtrado (τ={GYRO_TAU}s) y deadband={D_DEADBAND_DPS} dps.
+      Empieza con <code>Ki=0</code>.
     </div>
   </div>
 
@@ -302,7 +298,7 @@ function bindSlider(id, labId, fmt) {{
   const pid = await getPID();
   const kp = bindSlider('kp','kpv',v=>v.toFixed(1));
   const ki = bindSlider('ki','kiv',v=>v.toFixed(2));
-  const kd = bindSlider('kd','kdv',v=>v.toFixed(1));
+  const kd = bindSlider('kd','kdv',v=>v.toFixed(2));
   kp.slider.value = pid.kp; kp.updateLabel();
   ki.slider.value = pid.ki; ki.updateLabel();
   kd.slider.value = pid.kd; kd.updateLabel();
@@ -339,13 +335,13 @@ function bindSlider(id, labId, fmt) {{
             ki = float(j.get("ki"))
             kd = float(j.get("kd"))
         except Exception:
-            return jsonify({"ok": False, "error": "kp/ki/kd inválidos"}), 400
+            return {"ok": False, "error": "kp/ki/kd inválidos"}, 400
 
         kp = clamp(kp, KP_RANGE[0], KP_RANGE[1])
         ki = clamp(ki, KI_RANGE[0], KI_RANGE[1])
         kd = clamp(kd, KD_RANGE[0], KD_RANGE[1])
         set_pid(kp, ki, kd)
-        return jsonify({"ok": True, "kp": kp, "ki": ki, "kd": kd})
+        return {"ok": True, "kp": kp, "ki": ki, "kd": kd}
 
     app.run(host=WEB_HOST, port=WEB_PORT, debug=False, use_reloader=False, threaded=True)
 
@@ -361,24 +357,14 @@ def main() -> int:
     print(f"Web PID: http://<IP_RPI>:{WEB_PORT}/")
 
     bus = SMBus(I2C_BUS)
-    try:
-        mpu_wake(bus)
-    except Exception as e:
-        print(f"ERROR I2C: no se pudo inicializar MPU6050 en 0x{MPU_ADDR:02X}: {e}", file=sys.stderr)
-        bus.close()
-        return 3
+    mpu_wake(bus)
 
     print("Calibrando IMU (quieto y en posición de equilibrio)...")
-    try:
-        gyro_y_bias_dps = calibrate_gyro_y_bias(bus)
-        accel_zero_deg = calibrate_accel_angle_zero(bus)
-    except Exception as e:
-        print(f"ERROR I2C: calibración falló: {e}", file=sys.stderr)
-        bus.close()
-        return 4
+    gyro_y_bias_dps = calibrate_gyro_y_bias(bus)
+    accel_zero_deg = calibrate_accel_angle_zero(bus)
 
-    # ángulo inicial (tras calibración) = 0
     angle = 0.0
+    gyro_rate_f = 0.0
 
     print(f"OK. BiasGy={gyro_y_bias_dps:.6f} °/s | AccZero={accel_zero_deg:.6f} ° | Ang0=0.000°")
 
@@ -403,22 +389,19 @@ def main() -> int:
             elif dt > DT_MAX:
                 dt = DT_MAX
 
-            # IMU -> accel angle + gyro rate
-            try:
-                ax, az, gy_raw = read_accel_gyro(bus)
-                accel_angle = accel_angle_deg_from_ax_az(ax, az) - accel_zero_deg
-                gyro_rate = (gy_raw / GYRO_LSB_PER_DPS) - gyro_y_bias_dps
-                if INVERT_GYRO_RATE:
-                    gyro_rate = -gyro_rate
-            except Exception as e:
-                print(f"\nWARNING I2C: lectura IMU falló: {e}", file=sys.stderr)
-                accel_angle = 0.0
-                gyro_rate = 0.0
+            # IMU
+            ax, az, gy_raw = read_accel_gyro(bus)
+            accel_angle = accel_angle_deg_from_ax_az(ax, az) - accel_zero_deg
+            gyro_rate = (gy_raw / GYRO_LSB_PER_DPS) - gyro_y_bias_dps
+            if INVERT_GYRO_RATE:
+                gyro_rate = -gyro_rate
 
-            # ======= Filtro complementario =======
-            # Predicción con gyro (integración)
+            # LPF gyro for D
+            a = dt / (GYRO_TAU + dt) if dt > 0 else 0.0
+            gyro_rate_f += a * (gyro_rate - gyro_rate_f)
+
+            # Complementary filter
             angle_gyro = angle + gyro_rate * dt
-            # Corrección con accel
             angle = (COMP_ALPHA * angle_gyro) + ((1.0 - COMP_ALPHA) * accel_angle)
 
             # Safety cutoff
@@ -427,10 +410,9 @@ def main() -> int:
                 send_paced(ser, cmd_speed(ADDR_RIGHT, 0, 0))
                 integ = 0.0
                 base_rpm_cmd = 0.0
-                angle = 0.0  # opcional: reancla para que no se quede "lejos"
                 sys.stdout.write(f"\rCAIDO: Ang={angle:+07.2f} deg -> motores 0 rpm                           ")
                 sys.stdout.flush()
-
+                # timing
                 t_next += period
                 sleep_s = t_next - time.monotonic()
                 if sleep_s > 0:
@@ -439,17 +421,17 @@ def main() -> int:
                     t_next = time.monotonic()
                 continue
 
-            # PID params desde web
             kp, ki, kd = get_pid()
 
-            # Error con setpoint=0
             err = 0.0 - angle
 
             integ += err * dt
             integ = clamp(integ, -I_LIM, I_LIM)
 
-            # PD con gyro directo + integral opcional
-            base_rpm = (kp * err) - (kd * gyro_rate) + (ki * integ)
+            # Deadband for D
+            d_term_rate = 0.0 if abs(gyro_rate_f) < D_DEADBAND_DPS else gyro_rate_f
+
+            base_rpm = (kp * err) - (kd * d_term_rate) + (ki * integ)
             base_rpm = clamp(base_rpm, -BAL_MAX_RPM, +BAL_MAX_RPM)
 
             # Slew-rate
@@ -464,12 +446,13 @@ def main() -> int:
             send_paced(ser, cmd_speed(ADDR_RIGHT, mc.right_rpm, ACC))
 
             sys.stdout.write(
-                f"\rAng={angle:+07.2f} | Acc={accel_angle:+07.2f} | Gy={gyro_rate:+07.2f} dps | "
-                f"α={COMP_ALPHA:.3f} | PID(kp={kp:5.1f},ki={ki:5.2f},kd={kd:5.1f}) | "
-                f"base={base_rpm_cmd:+06.1f} | L={mc.left_rpm:+04d} R={mc.right_rpm:+04d}     "
+                f"\rAng={angle:+07.2f} | Acc={accel_angle:+07.2f} | Gy={gyro_rate:+07.2f} | GyF={gyro_rate_f:+07.2f} | "
+                f"PID(kp={kp:5.1f},ki={ki:4.2f},kd={kd:4.2f}) | base={base_rpm_cmd:+06.1f} | "
+                f"L={mc.left_rpm:+04d} R={mc.right_rpm:+04d}     "
             )
             sys.stdout.flush()
 
+            # timing
             t_next += period
             sleep_s = t_next - time.monotonic()
             if sleep_s > 0:
