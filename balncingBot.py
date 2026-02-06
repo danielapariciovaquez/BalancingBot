@@ -27,18 +27,21 @@ INVERT_RIGHT = True
 # ====================================================================
 
 # ===================== CONFIG (GY-521 / MPU6050) =====================
-I2C_BUS = 1          # Raspberry Pi: normalmente 1
-MPU_ADDR = 0x68      # GY-521 típico (AD0=0). Si AD0=1 -> 0x69
+I2C_BUS = 1
+MPU_ADDR = 0x68  # típico si AD0=0; si AD0=1 -> 0x69
 
 # Registros MPU6050
-REG_PWR_MGMT_1 = 0x6B
-REG_GYRO_ZOUT_H = 0x47  # GZ_H, GZ_L están en 0x47 y 0x48
+REG_PWR_MGMT_1   = 0x6B
+REG_GYRO_XOUT_H  = 0x43  # GX_H=0x43, GX_L=0x44
 
-# Sensibilidad por defecto (FS_SEL=0 => ±250 dps) => 131 LSB/(°/s)
+# Sensibilidad típica por defecto (FS_SEL=0 => ±250 dps) => 131 LSB/(°/s)
 GYRO_LSB_PER_DPS = 131.0
 
-# Calibración de bias del gyro Z al arrancar (muestras)
+# Calibración bias al arranque
 CAL_SAMPLES = 500
+
+# Protección contra jitter (si el loop se bloquea, evita integrar dt enorme)
+DT_MAX = 0.1  # s
 # ====================================================================
 
 # --- I2C backend (smbus2 preferente, si no smbus) ---
@@ -130,11 +133,10 @@ def i2c_require():
         raise RuntimeError(
             "No se encontró smbus2/smbus. Instala:\n"
             "  pip3 install smbus2\n"
-            "y asegúrate de tener i2c habilitado (raspi-config) y permisos."
+            "y habilita i2c (raspi-config) + permisos /dev/i2c-1."
         )
 
 def read_i16_be(bus: SMBus, addr: int, reg_hi: int) -> int:
-    """Lee un int16 big-endian desde reg_hi y reg_hi+1."""
     hi = bus.read_byte_data(addr, reg_hi)
     lo = bus.read_byte_data(addr, reg_hi + 1)
     v = (hi << 8) | lo
@@ -143,22 +145,21 @@ def read_i16_be(bus: SMBus, addr: int, reg_hi: int) -> int:
     return v
 
 def mpu_wake(bus: SMBus) -> None:
-    # Mínimo imprescindible: salir de SLEEP (PWR_MGMT_1)
+    # Mínimo: salir de sleep
     bus.write_byte_data(MPU_ADDR, REG_PWR_MGMT_1, 0x00)
     time.sleep(0.05)
 
-def calibrate_gyro_z_bias(bus: SMBus) -> float:
+def calibrate_gyro_x_bias(bus: SMBus) -> float:
     """
-    Calcula bias del gyro Z en °/s promediando CAL_SAMPLES lecturas.
-    Durante esta fase el sensor debe estar quieto.
+    Bias del gyro X en °/s, calculado UNA SOLA VEZ al arranque.
+    Sensor quieto durante CAL_SAMPLES.
     """
-    acc = 0.0
+    s = 0.0
     for _ in range(CAL_SAMPLES):
-        raw_gz = read_i16_be(bus, MPU_ADDR, REG_GYRO_ZOUT_H)
-        acc += (raw_gz / GYRO_LSB_PER_DPS)
-        # Pequeña espera para no saturar I2C; no fija la tasa de loop principal.
+        raw_gx = read_i16_be(bus, MPU_ADDR, REG_GYRO_XOUT_H)
+        s += (raw_gx / GYRO_LSB_PER_DPS)
         time.sleep(0.001)
-    return acc / float(CAL_SAMPLES)
+    return s / float(CAL_SAMPLES)
 
 # ===================== main =====================
 
@@ -174,16 +175,17 @@ def main() -> int:
         bus.close()
         return 3
 
-    print("Calibrando gyro Z (mantén el GY-521 quieto)...")
+    # --- Calibración SOLO AL INICIO ---
+    print("Calibrando gyro X (una sola vez). Mantén el GY-521 quieto...")
     try:
-        gyro_z_bias_dps = calibrate_gyro_z_bias(bus)
+        gyro_x_bias_dps = calibrate_gyro_x_bias(bus)
     except Exception as e:
-        print(f"ERROR I2C: no se pudo calibrar gyro Z: {e}", file=sys.stderr)
+        print(f"ERROR I2C: no se pudo calibrar gyro X: {e}", file=sys.stderr)
         bus.close()
         return 4
 
-    yaw_deg = 0.0
-    print(f"Bias gyro Z = {gyro_z_bias_dps:.6f} °/s | Yaw inicial = 0.000 °")
+    angle_x_deg = 0.0  # cero sólo al inicio
+    print(f"OK. Bias Gx={gyro_x_bias_dps:.6f} °/s | Ángulo X inicial=0.000 °")
 
     # RS485 init
     ser = open_serial()
@@ -207,6 +209,7 @@ def main() -> int:
     send(ser, cmd_enable(ADDR_RIGHT, True))
     time.sleep(0.05)
 
+    # Timing
     period = 1.0 / UPDATE_HZ
     t_next = time.monotonic()
     t_prev = t_next
@@ -215,19 +218,22 @@ def main() -> int:
         while True:
             pygame.event.pump()
 
-            # --- GYRO Z -> yaw ---
             now = time.monotonic()
             dt = now - t_prev
             t_prev = now
+            if dt < 0:
+                dt = 0.0
+            elif dt > DT_MAX:
+                dt = DT_MAX  # evita “saltos” enormes si el loop se bloquea
 
+            # --- Gyro X -> ángulo ---
             try:
-                raw_gz = read_i16_be(bus, MPU_ADDR, REG_GYRO_ZOUT_H)
-                gz_dps = (raw_gz / GYRO_LSB_PER_DPS) - gyro_z_bias_dps
-                yaw_deg += gz_dps * dt
+                raw_gx = read_i16_be(bus, MPU_ADDR, REG_GYRO_XOUT_H)
+                gx_dps = (raw_gx / GYRO_LSB_PER_DPS) - gyro_x_bias_dps
+                angle_x_deg += gx_dps * dt
             except Exception as e:
-                # Si falla I2C puntualmente, no matamos el robot; sólo avisamos.
-                print(f"\nWARNING I2C: lectura gyro Z falló: {e}", file=sys.stderr)
-                gz_dps = 0.0
+                print(f"\nWARNING I2C: lectura gyro X falló: {e}", file=sys.stderr)
+                gx_dps = 0.0
 
             # --- Joystick -> diferencial ---
             thr = -joy.get_axis(AXIS_THROTTLE)
@@ -243,13 +249,13 @@ def main() -> int:
             send(ser, cmd_speed(ADDR_RIGHT, mc.right_rpm, ACC))
 
             # --- Print status (una línea) ---
-            # \r para refrescar en la misma línea
             sys.stdout.write(
-                f"\rYaw(Z)={yaw_deg:+08.3f} deg | Gz={gz_dps:+07.3f} dps | L={mc.left_rpm:+04d} rpm R={mc.right_rpm:+04d} rpm   "
+                f"\rAngX={angle_x_deg:+08.3f} deg | Gx={gx_dps:+07.3f} dps | "
+                f"L={mc.left_rpm:+04d} rpm R={mc.right_rpm:+04d} rpm   "
             )
             sys.stdout.flush()
 
-            # Timing
+            # Loop timing
             t_next += period
             sleep_s = t_next - time.monotonic()
             if sleep_s > 0:
