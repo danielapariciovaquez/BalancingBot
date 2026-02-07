@@ -12,7 +12,7 @@ TIMEOUT_S = 0.08
 ADDR1 = 0x01
 ADDR2 = 0x02
 
-MAX_RPM = 3000          # rango del manual para F6
+MAX_RPM = 300          # rango del manual para F6
 ACC_DEFAULT = 255       # aceleración por defecto
 INTER_FRAME_DELAY_S = 0.004
 
