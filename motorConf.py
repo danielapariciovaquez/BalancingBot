@@ -13,13 +13,17 @@ from flask import Flask, request, Response
 RS485_PORT = "/dev/ttyUSB0"
 RS485_BAUD = 38400
 RS485_TIMEOUT_S = 0.05
-INTER_FRAME_DELAY_S = 0.002
+INTER_FRAME_DELAY_S = 0.003  # un pelín más conservador
 
 MOTOR1_ADDR = 0x01
 MOTOR2_ADDR = 0x02
 
 HTTP_HOST = "0.0.0.0"
 HTTP_PORT = 8080
+
+# Debounce server-side (además del cliente)
+MIN_SPEED_SEND_DT = 0.05   # 50 ms
+MIN_PID_SEND_DT   = 0.20   # 200 ms
 # ==================================================
 
 # ------------------ MKS helpers ------------------
@@ -37,11 +41,12 @@ def frame_enable(addr: int, enable: bool) -> bytes:
 def frame_speed(addr: int, rpm: int, acc: int) -> bytes:
     if not (0 <= acc <= 255):
         raise ValueError("ACC fuera de rango (0..255)")
-    speed = abs(int(rpm))
+    rpm = int(rpm)
+    speed = abs(rpm)
     if not (0 <= speed <= 3000):
         raise ValueError("RPM fuera de rango (-3000..3000)")
 
-    dir_bit = 1 if rpm < 0 else 0  # bit7
+    dir_bit = 1 if rpm < 0 else 0
     byte4 = ((dir_bit & 1) << 7) | ((speed >> 8) & 0x0F)
     byte5 = speed & 0xFF
     return build_frame(addr, 0xF6, bytes([byte4, byte5, acc & 0xFF]))
@@ -49,12 +54,13 @@ def frame_speed(addr: int, rpm: int, acc: int) -> bytes:
 def frame_pid(addr: int, mode: str, kp: int, ki: int, kd: int, kv: int) -> bytes:
     if mode not in ("vFOC", "CLOSE"):
         raise ValueError("PID mode debe ser 'vFOC' o 'CLOSE'")
-    for name, v in (("kp", kp), ("ki", ki), ("kd", kd), ("kv", kv)):
-        if not (0 <= int(v) <= 1024):
+    vals = [int(kp), int(ki), int(kd), int(kv)]
+    for name, v in zip(("kp", "ki", "kd", "kv"), vals):
+        if not (0 <= v <= 1024):
             raise ValueError(f"{name} fuera de rango (0..1024)")
 
     code = 0x96 if mode == "vFOC" else 0x97
-    kp = int(kp); ki = int(ki); kd = int(kd); kv = int(kv)
+    kp, ki, kd, kv = vals
     data = bytes([
         (kp >> 8) & 0xFF, kp & 0xFF,
         (ki >> 8) & 0xFF, ki & 0xFF,
@@ -63,6 +69,18 @@ def frame_pid(addr: int, mode: str, kp: int, ki: int, kd: int, kv: int) -> bytes
     ])
     return build_frame(addr, code, data)
 
+def frame_resp_active(addr: int, respond: bool, active: bool) -> bytes:
+    # 8C XX YY (respond, active)
+    return build_frame(addr, 0x8C, bytes([0x01 if respond else 0x00, 0x01 if active else 0x00]))
+
+def frame_modbus_enable(addr: int, enable: bool) -> bytes:
+    # 8E 00 desactiva MODBUS-RTU; 8E 01 lo activa
+    return build_frame(addr, 0x8E, bytes([0x01 if enable else 0x00]))
+
+def frame_work_mode(addr: int, mode: int) -> bytes:
+    # 82 mode (ej: 0x05 SR_vFOC)
+    return build_frame(addr, 0x82, bytes([mode & 0xFF]))
+
 # ------------------ RS485 driver ------------------
 
 class MksBus:
@@ -70,8 +88,18 @@ class MksBus:
         self._ser = serial.Serial(port=port, baudrate=baud, timeout=timeout_s)
         self._lock = threading.Lock()
 
+    def _drain_rx(self):
+        # Vacía cualquier byte pendiente (eco/ruido) antes de enviar
+        n = self._ser.in_waiting
+        if n:
+            try:
+                self._ser.read(n)
+            except Exception:
+                pass
+
     def send(self, payload: bytes):
         with self._lock:
+            self._drain_rx()
             self._ser.write(payload)
             self._ser.flush()
         time.sleep(INTER_FRAME_DELAY_S)
@@ -85,6 +113,16 @@ class MksBus:
 
 app = Flask(__name__)
 bus: MksBus | None = None
+
+# Estado mínimo para no reenviar si no cambia
+_last = {
+    "enable": None,
+    "rpm": None,
+    "acc": None,
+    "pid": None,     # tuple (mode,kp,ki,kd,kv)
+    "t_speed": 0.0,
+    "t_pid": 0.0,
+}
 
 HTML = r"""<!doctype html>
 <html lang="es">
@@ -106,19 +144,19 @@ HTML = r"""<!doctype html>
 </head>
 <body>
 <h2>MKS SERVO RS485 – Control común M1 + M2</h2>
-<div class="small">Sin botones: envía en caliente con debounce.</div>
+<div class="small">Sin botones: envía en caliente.</div>
 
 <div class="card">
   <h3>Enable</h3>
   <div class="toggle">
-    <input id="en" type="checkbox" onchange="onEnable()">
+    <input id="en" type="checkbox" onchange="sendEnable()">
     <label for="en">Motores habilitados (F3)</label>
   </div>
   <div id="enStatus" class="small"></div>
 </div>
 
 <div class="card">
-  <h3>Velocidad común (F6)</h3>
+  <h3>Velocidad común</h3>
   <div class="row">
     <div>ACC (0..255)</div>
     <input id="acc" type="range" min="0" max="255" value="10" oninput="onSpeed()">
@@ -134,7 +172,6 @@ HTML = r"""<!doctype html>
 
 <div class="card">
   <h3>PID común (manda speed=0 antes)</h3>
-
   <div class="row">
     <div>Modo</div>
     <select id="mode" onchange="onPid()">
@@ -143,52 +180,42 @@ HTML = r"""<!doctype html>
     </select>
     <div></div>
   </div>
-
   <div class="row">
     <div>Kp (0..1024)</div>
     <input id="kp" type="range" min="0" max="1024" value="220" oninput="onPid()">
     <div><span id="kpv">220</span></div>
   </div>
-
   <div class="row">
     <div>Ki (0..1024)</div>
     <input id="ki" type="range" min="0" max="1024" value="100" oninput="onPid()">
     <div><span id="kiv">100</span></div>
   </div>
-
   <div class="row">
     <div>Kd (0..1024)</div>
     <input id="kd" type="range" min="0" max="1024" value="270" oninput="onPid()">
     <div><span id="kdv">270</span></div>
   </div>
-
   <div class="row">
     <div>Kv (0..1024)</div>
     <input id="kv" type="range" min="0" max="1024" value="320" oninput="onPid()">
     <div><span id="kvv">320</span></div>
   </div>
-
   <div id="pidStatus" class="small"></div>
 </div>
 
 <script>
-let tSpeed = null;
-let tPid = null;
+let tSpeed=null, tPid=null;
 
 function qs(id){ return document.getElementById(id); }
 
 async function post(path, body){
-  const r = await fetch(path, {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify(body)
-  });
+  const r = await fetch(path, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
   const txt = await r.text();
   if(!r.ok) throw new Error(txt || ("HTTP " + r.status));
   return txt;
 }
 
-async function onEnable(){
+async function sendEnable(){
   try{
     const en = qs("en").checked;
     const t = await post("/api/enable", {enable: en});
@@ -202,15 +229,12 @@ function onSpeed(){
   qs("accv").textContent = qs("acc").value;
   qs("rpmv").textContent = qs("rpm").value;
   if(tSpeed) clearTimeout(tSpeed);
-  tSpeed = setTimeout(sendSpeed, 80); // debounce corto
+  tSpeed = setTimeout(sendSpeed, 80);
 }
 
 async function sendSpeed(){
-  const body = {
-    rpm: parseInt(qs("rpm").value),
-    acc: parseInt(qs("acc").value)
-  };
   try{
+    const body = { rpm: parseInt(qs("rpm").value), acc: parseInt(qs("acc").value) };
     const t = await post("/api/speed", body);
     qs("spStatus").innerHTML = '<span class="ok">' + t + '</span>';
   }catch(e){
@@ -223,20 +247,19 @@ function onPid(){
   qs("kiv").textContent = qs("ki").value;
   qs("kdv").textContent = qs("kd").value;
   qs("kvv").textContent = qs("kv").value;
-
   if(tPid) clearTimeout(tPid);
-  tPid = setTimeout(sendPid, 150); // debounce un poco mayor
+  tPid = setTimeout(sendPid, 150);
 }
 
 async function sendPid(){
-  const body = {
-    mode: qs("mode").value,
-    kp: parseInt(qs("kp").value),
-    ki: parseInt(qs("ki").value),
-    kd: parseInt(qs("kd").value),
-    kv: parseInt(qs("kv").value),
-  };
   try{
+    const body = {
+      mode: qs("mode").value,
+      kp: parseInt(qs("kp").value),
+      ki: parseInt(qs("ki").value),
+      kd: parseInt(qs("kd").value),
+      kv: parseInt(qs("kv").value),
+    };
     const t = await post("/api/pid", body);
     qs("pidStatus").innerHTML = '<span class="ok">' + t + '</span>';
   }catch(e){
@@ -244,11 +267,7 @@ async function sendPid(){
   }
 }
 
-window.addEventListener("load", () => {
-  // Inicializa texto
-  onSpeed();
-  onPid();
-});
+window.addEventListener("load", () => { onSpeed(); onPid(); });
 </script>
 </body>
 </html>
@@ -258,15 +277,22 @@ window.addEventListener("load", () => {
 def index():
     return Response(HTML, mimetype="text/html")
 
+def init_motor(addr: int):
+    # Secuencia robusta para evitar “no hace nada”
+    bus.send(frame_modbus_enable(addr, False))      # por si estuviera en MODBUS-RTU
+    bus.send(frame_resp_active(addr, True, True))   # responder + activo (debug)
+    bus.send(frame_work_mode(addr, 0x05))           # SR_vFOC (bus control)
+
 @app.post("/api/enable")
 def api_enable():
-    data = request.get_json(force=True)
-    enable = bool(data.get("enable"))
+    enable = bool(request.get_json(force=True).get("enable"))
+    if _last["enable"] is enable:
+        return Response("OK (sin cambios)", mimetype="text/plain")
 
     bus.send(frame_enable(MOTOR1_ADDR, enable))
     bus.send(frame_enable(MOTOR2_ADDR, enable))
-
-    return Response(f"OK: {'ENABLE' if enable else 'DISABLE'} enviado a M1+M2", mimetype="text/plain")
+    _last["enable"] = enable
+    return Response(f"OK: {'ENABLE' if enable else 'DISABLE'} M1+M2", mimetype="text/plain")
 
 @app.post("/api/speed")
 def api_speed():
@@ -274,11 +300,20 @@ def api_speed():
     rpm = int(data.get("rpm", 0))
     acc = int(data.get("acc", 0))
 
-    # Un único valor aplicado a ambos motores
+    now = time.time()
+    if now - _last["t_speed"] < MIN_SPEED_SEND_DT:
+        return Response("OK (rate-limited)", mimetype="text/plain")
+
+    if _last["rpm"] == rpm and _last["acc"] == acc:
+        return Response("OK (sin cambios)", mimetype="text/plain")
+
     bus.send(frame_speed(MOTOR1_ADDR, rpm, acc))
     bus.send(frame_speed(MOTOR2_ADDR, rpm, acc))
 
-    return Response(f"OK: SPEED enviado a M1+M2 (rpm={rpm}, acc={acc})", mimetype="text/plain")
+    _last["rpm"] = rpm
+    _last["acc"] = acc
+    _last["t_speed"] = now
+    return Response(f"OK: SPEED M1+M2 rpm={rpm} acc={acc}", mimetype="text/plain")
 
 @app.post("/api/pid")
 def api_pid():
@@ -288,16 +323,26 @@ def api_pid():
     ki = int(data.get("ki", 0))
     kd = int(data.get("kd", 0))
     kv = int(data.get("kv", 0))
+    pid_tuple = (mode, kp, ki, kd, kv)
 
-    # Condición: antes de PID, parar motores -> speed=0
+    now = time.time()
+    if now - _last["t_pid"] < MIN_PID_SEND_DT:
+        return Response("OK (rate-limited)", mimetype="text/plain")
+
+    if _last["pid"] == pid_tuple:
+        return Response("OK (sin cambios)", mimetype="text/plain")
+
+    # Parada previa obligatoria
     bus.send(frame_speed(MOTOR1_ADDR, 0, 0))
     bus.send(frame_speed(MOTOR2_ADDR, 0, 0))
+    time.sleep(0.05)  # margen mínimo para que el driver “asiente” la parada
 
-    # Ahora PID a ambos
     bus.send(frame_pid(MOTOR1_ADDR, mode, kp, ki, kd, kv))
     bus.send(frame_pid(MOTOR2_ADDR, mode, kp, ki, kd, kv))
 
-    return Response(f"OK: PID {mode} enviado a M1+M2 (antes speed=0)", mimetype="text/plain")
+    _last["pid"] = pid_tuple
+    _last["t_pid"] = now
+    return Response(f"OK: PID {mode} M1+M2 (antes speed=0)", mimetype="text/plain")
 
 # -------------- shutdown: disable --------------
 
@@ -321,6 +366,10 @@ def _sig_handler(signum, frame):
 def main():
     global bus
     bus = MksBus(RS485_PORT, RS485_BAUD, RS485_TIMEOUT_S)
+
+    # Inicialización “anti no-responde”
+    init_motor(MOTOR1_ADDR)
+    init_motor(MOTOR2_ADDR)
 
     atexit.register(shutdown_disable)
     signal.signal(signal.SIGINT, _sig_handler)
