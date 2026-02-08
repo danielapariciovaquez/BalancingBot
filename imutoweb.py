@@ -23,7 +23,7 @@ ENABLE_RETRY_DELAY_S = 0.02
 
 # F4 requiere speed+acc en el payload (aunque tú solo quieras "posición")
 POS_SPEED_RPM = 300
-POS_ACC = 255
+POS_ACC = 10
 # ===========================================================
 
 # ===================== I2C / MPU6050 (GY-521) =====================
