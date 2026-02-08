@@ -46,7 +46,7 @@ UPDATE_HZ = 50
 ANGLE_DEADBAND_DEG = 0.2   # umbral para enviar (evita spam por ruido)
 
 # Media móvil sobre el ángulo en grados (recomendado 5..15)
-MA_WINDOW = 15
+MA_WINDOW = 100
 # ===============================================================
 
 try:
