@@ -14,7 +14,7 @@ ADDR_LEFT  = 0x01
 ADDR_RIGHT = 0x02
 
 # MKS: speed range 0..3000 RPM (12 bits)
-MAX_RPM = 30
+MAX_RPM = 300
 
 # Aceleración (0..255). OJO: en el manual, acc=0 implica parada inmediata cuando speed=0.
 ACC = 255
@@ -156,7 +156,7 @@ def main() -> int:
 
             # Lee ejes
             thr = -joy.get_axis(AXIS_THROTTLE)  # invert típico: arriba suele ser negativo
-            trn = joy.get_axis(AXIS_TURN)
+            trn = joy.get_axis(AXIS_TURN)/4
 
             thr = dz(thr, DEADZONE)
             trn = dz(trn, DEADZONE)
