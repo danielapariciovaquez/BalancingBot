@@ -14,8 +14,8 @@ ADDR_M1 = 0x01
 ADDR_M2 = 0x02
 
 # Inversión sencilla por motor (si están montados en sentidos opuestos)
-INVERT_M1 = True
-INVERT_M2 = False
+INVERT_M1 = False
+INVERT_M2 = True
 
 INTER_FRAME_DELAY_S = 0.004
 ENABLE_RETRIES = 2
