@@ -14,10 +14,10 @@ ADDR_LEFT  = 0x01
 ADDR_RIGHT = 0x02
 
 # MKS: speed range 0..3000 RPM (12 bits)
-MAX_RPM = 100
+MAX_RPM = 200
 
 # Aceleración (0..255). OJO: en el manual, acc=0 implica parada inmediata cuando speed=0.
-ACC = 250
+ACC = 255
 
 # Control joystick
 DEADZONE = 0.008
