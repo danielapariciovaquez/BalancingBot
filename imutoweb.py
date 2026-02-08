@@ -22,8 +22,8 @@ ENABLE_RETRIES = 2
 ENABLE_RETRY_DELAY_S = 0.02
 
 # F4 requiere speed+acc en el payload (aunque tú solo quieras "posición")
-POS_SPEED_RPM = 30
-POS_ACC = 10
+POS_SPEED_RPM = 300
+POS_ACC = 255
 # ===========================================================
 
 # ===================== I2C / MPU6050 (GY-521) =====================
@@ -46,7 +46,7 @@ UPDATE_HZ = 50
 ANGLE_DEADBAND_DEG = 0.2   # umbral para enviar (evita spam por ruido)
 
 # Media móvil sobre el ángulo en grados (recomendado 5..15)
-MA_WINDOW = 9
+MA_WINDOW = 15
 # ===============================================================
 
 try:
