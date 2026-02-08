@@ -3,6 +3,7 @@ import time
 import math
 import sys
 import serial
+from collections import deque
 
 # ===================== RS485 / MOTORES =====================
 PORT = "/dev/ttyUSB0"
@@ -12,12 +13,15 @@ TIMEOUT_S = 0.05
 ADDR_M1 = 0x01
 ADDR_M2 = 0x02
 
+# Inversión sencilla por motor (si están montados en sentidos opuestos)
+INVERT_M1 = False
+INVERT_M2 = True
+
 INTER_FRAME_DELAY_S = 0.004
 ENABLE_RETRIES = 2
 ENABLE_RETRY_DELAY_S = 0.02
 
-# Comando F4 requiere speed + acc (aunque tú solo quieras "posición")
-# Speed range: 0..3000 RPM, acc: 0..255 :contentReference[oaicite:2]{index=2}
+# F4 requiere speed+acc en el payload (aunque tú solo quieras "posición")
 POS_SPEED_RPM = 30
 POS_ACC = 255
 # ===========================================================
@@ -33,13 +37,16 @@ ACC_LSB_PER_G = 16384.0  # ±2g default si no configuras rango
 # ===============================================================
 
 # ===================== Conversión grados -> axis =====================
-COUNTS_PER_TURN = 16384  # 16384/turn :contentReference[oaicite:3]{index=3}
-DEG_PER_TURN = 360.0
-COUNTS_PER_DEG = COUNTS_PER_TURN / DEG_PER_TURN
+COUNTS_PER_TURN = 16384  # 16384/turn (manual)
+COUNTS_PER_DEG = COUNTS_PER_TURN / 360.0
 # ===============================================================
 
+# ===================== Loop + filtros =====================
 UPDATE_HZ = 50
-ANGLE_DEADBAND_DEG = 0.2  # evita spam de tramas por ruido
+ANGLE_DEADBAND_DEG = 0.2   # umbral para enviar (evita spam por ruido)
+
+# Media móvil sobre el ángulo en grados (recomendado 5..15)
+MA_WINDOW = 9
 # ===============================================================
 
 try:
@@ -79,8 +86,7 @@ def cmd_enable(addr: int, en: bool) -> bytes:
 def cmd_pos_rel_axis_f4(addr: int, speed_rpm: int, acc: int, rel_axis: int) -> bytes:
     """
     Position mode 3: relative motion by axis (F4)
-    Downlink: FA addr F4 speed(2B) acc(1B) relAxis(int32) CRC :contentReference[oaicite:4]{index=4}
-    speed: 0..3000 RPM, acc: 0..255, relAxis: int32_t :contentReference[oaicite:5]{index=5}
+    Downlink: FA addr F4 speed(2B) acc(1B) relAxis(int32) CRC
     """
     speed_rpm = clamp_int(int(speed_rpm), 0, 3000)
     acc = clamp_int(int(acc), 0, 255)
@@ -89,11 +95,10 @@ def cmd_pos_rel_axis_f4(addr: int, speed_rpm: int, acc: int, rel_axis: int) -> b
     speed_hi = (speed_rpm >> 8) & 0xFF
     speed_lo = speed_rpm & 0xFF
 
-    # int32 big-endian
     rel_u32 = rel_axis & 0xFFFFFFFF
-    b7 = (rel_u32 >> 24) & 0xFF
-    b8 = (rel_u32 >> 16) & 0xFF
-    b9 = (rel_u32 >> 8) & 0xFF
+    b7  = (rel_u32 >> 24) & 0xFF
+    b8  = (rel_u32 >> 16) & 0xFF
+    b9  = (rel_u32 >> 8) & 0xFF
     b10 = rel_u32 & 0xFF
 
     payload = bytes([speed_hi, speed_lo, acc, b7, b8, b9, b10])
@@ -142,16 +147,42 @@ def mpu_wake(bus: SMBus) -> None:
 def read_az_raw(bus: SMBus) -> int:
     # Leer AX..AZ (6 bytes) y tomar AZ (bytes 4..5)
     data = bus.read_i2c_block_data(MPU_ADDR, REG_ACCEL_XOUT_H, 6)
-    az = i16(data[4], data[5])
-    return az
+    return i16(data[4], data[5])
 
 
 def az_to_angle_deg(az_raw: int) -> float:
-    # az_g clamped a [-1,1] para evitar NaN
+    """
+    Conversión sólo con Z:
+      az_g = az_raw/LSB
+      angle = acos(clamp(az_g,-1..1)) -> 0..180 deg
+    (Sin signo: no distingue hacia qué lado cae con solo AZ)
+    """
     az_g = az_raw / ACC_LSB_PER_G
-    az_g = -1.0 if az_g < -1.0 else 1.0 if az_g > 1.0 else az_g
-    # 0° -> az_g=+1, 90° -> 0, 180° -> -1
+    if az_g < -1.0:
+        az_g = -1.0
+    elif az_g > 1.0:
+        az_g = 1.0
     return math.degrees(math.acos(az_g))
+
+
+class MovingAverage:
+    def __init__(self, n: int):
+        n = int(n)
+        if n < 1:
+            n = 1
+        self.buf = deque(maxlen=n)
+        self.sum = 0.0
+
+    def push(self, x: float) -> float:
+        if len(self.buf) == self.buf.maxlen:
+            self.sum -= self.buf[0]
+        self.buf.append(x)
+        self.sum += x
+        return self.sum / len(self.buf)
+
+
+def apply_inversion(rel_counts: int, invert: bool) -> int:
+    return -rel_counts if invert else rel_counts
 
 
 def main() -> int:
@@ -166,32 +197,43 @@ def main() -> int:
     send_enable_robust(ser, ADDR_M1, True)
     send_enable_robust(ser, ADDR_M2, True)
 
+    ma = MovingAverage(MA_WINDOW)
+
+    # Inicializa referencia (con media móvil ya “cebada”)
+    az0 = read_az_raw(bus)
+    ang0 = az_to_angle_deg(az0)
+    ang0_f = ma.push(ang0)
+    last_angle_f = ang0_f
+
+    print(f"ENABLE OK. AngleZ start = {last_angle_f:.2f} deg | MA_WINDOW={MA_WINDOW}")
+    print("Enviando SOLO: F3 (enable) + F4 (pos relativa por axis) a motor 1 y 2. Ctrl+C para salir.")
+
     period = 1.0 / UPDATE_HZ
     t_next = time.monotonic()
-
-    # Inicializa referencia de ángulo
-    az0 = read_az_raw(bus)
-    last_angle = az_to_angle_deg(az0)
-
-    print(f"ENABLE OK. AngleZ(deg) start = {last_angle:.2f}")
-    print("Enviando SOLO comandos F4 (posición relativa por axis) a motor 1 y 2... Ctrl+C para salir.")
 
     try:
         while True:
             az = read_az_raw(bus)
             ang = az_to_angle_deg(az)
+            ang_f = ma.push(ang)
 
-            ddeg = ang - last_angle
+            ddeg = ang_f - last_angle_f
             if abs(ddeg) >= ANGLE_DEADBAND_DEG:
                 rel_counts = int(round(ddeg * COUNTS_PER_DEG))
 
-                # Enviar SOLO posición relativa (F4) a ambos motores
-                send_paced(ser, cmd_pos_rel_axis_f4(ADDR_M1, POS_SPEED_RPM, POS_ACC, rel_counts))
-                send_paced(ser, cmd_pos_rel_axis_f4(ADDR_M2, POS_SPEED_RPM, POS_ACC, rel_counts))
+                rel_m1 = apply_inversion(rel_counts, INVERT_M1)
+                rel_m2 = apply_inversion(rel_counts, INVERT_M2)
 
-                last_angle = ang
+                # ===== SOLO: manda F4 a ambos motores =====
+                send_paced(ser, cmd_pos_rel_axis_f4(ADDR_M1, POS_SPEED_RPM, POS_ACC, rel_m1))
+                send_paced(ser, cmd_pos_rel_axis_f4(ADDR_M2, POS_SPEED_RPM, POS_ACC, rel_m2))
 
-                sys.stdout.write(f"\rAZ_raw={az:+6d}  AngleZ={ang:7.2f} deg  d={ddeg:+6.2f} deg  relAxis={rel_counts:+7d}     ")
+                last_angle_f = ang_f
+
+                sys.stdout.write(
+                    f"\rAZ_raw={az:+6d}  Ang={ang:7.2f}  AngF={ang_f:7.2f}  d={ddeg:+6.2f} deg  "
+                    f"rel={rel_counts:+7d}  M1={rel_m1:+7d} M2={rel_m2:+7d}     "
+                )
                 sys.stdout.flush()
 
             t_next += period
@@ -202,7 +244,7 @@ def main() -> int:
                 t_next = time.monotonic()
 
     except KeyboardInterrupt:
-        print("\nSaliendo (no se envían más tramas que las indicadas).")
+        print("\nSaliendo (no se envían más tramas que enable + F4).")
 
     finally:
         try:
