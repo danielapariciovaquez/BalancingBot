@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-BalancingBot mínimo (Raspberry Pi):
-- IMU GY-521 (MPU6050) por I2C
-- 2x MKS SERVO42D por RS485 (pyserial), con un motor invertido
-- Fusión Kalman 1D (ángulo) + PID -> velocidad (RPM) en modo SR_vFOC
-- Interfaz web mínima (Flask) para ajustar parámetros en caliente
-- Seguridad: si se cae (|ángulo| > limite), para y deshabilita motores
+BalancingBot mínimo con RESTRICCIÓN:
+- A los motores MKS SERVO42D por RS485 SOLO se les manda:
+  * ENABLE/DISABLE: 0xF3
+  * VELOCIDAD:      0xF6
+No se envía ninguna otra trama (ni 0x82, ni 0x8C, etc.)
+
+Incluye:
+- MPU6050 (GY-521) por I2C: init + calibración gyro al arrancar
+- Kalman 1D para ángulo
+- PID para mantener 0 grados
+- Web UI (Flask) para Kp/Ki/Kd, max_rpm, acc, límites, Kalman, invertir gyro
+- Seguridad: si |ángulo| > limite => F6=0 y F3=disable
+- En salida del programa: F6=0 y F3=disable siempre
 """
 
 import math
@@ -36,41 +43,41 @@ MPU_ADDR = 0x68
 RS485_PORT = "/dev/ttyUSB0"
 RS485_BAUD = 38400
 RS485_TIMEOUT_S = 0.05
-INTER_FRAME_DELAY_S = 0.002  # pequeño; evita saturar el bus
+INTER_FRAME_DELAY_S = 0.002
 
 MOTOR1_ADDR = 0x01
 MOTOR2_ADDR = 0x02
 
-# Si un motor está montado al revés, ajusta signos aquí
+# Sentido por motor (uno invertido)
 M1_SIGN = +1
 M2_SIGN = -1
 
+
 # ============================================================
-# PARÁMETROS CONTROL (valores iniciales conservadores)
+# PARÁMETROS CONTROL (valores iniciales neutros)
 # ============================================================
 
 @dataclass
 class Params:
-    # Loop
     loop_hz: float = 200.0
 
     # Seguridad
     safe_angle_deg: float = 25.0
 
-    # Salida a motor
-    max_rpm: int = 200        # límite absoluto de RPM
-    acc: int = 50             # 0..255 (MKS); aceleración en modo velocidad
+    # Salida motor
+    max_rpm: int = 200
+    acc: int = 50  # 0..255
 
-    # PID (sobre ángulo)
+    # PID
     kp: float = 25.0
     ki: float = 0.0
     kd: float = 0.8
-    integrator_limit: float = 300.0  # anti-windup (en unidades de salida PID)
+    integrator_limit: float = 300.0
 
-    # IMU: inversión opcional de gyro (según montaje)
-    invert_gyro: bool = False
+    # IMU
+    invert_gyro: bool = False  # invierte signo del gyro usado en el eje de balanceo
 
-    # Kalman 1D (ángulo)
+    # Kalman 1D
     q_angle: float = 0.001
     q_bias: float = 0.003
     r_measure: float = 0.03
@@ -79,67 +86,54 @@ P = Params()
 
 
 # ============================================================
-# UTILIDADES MKS SERVO RS485 (checksum 8-bit = suma & 0xFF)
+# MKS SERVO RS485 (SOLO F3 y F6)
+# CRC = checksum 8-bit (suma de bytes & 0xFF) del frame sin CRC
 # ============================================================
 
 def checksum8(data: bytes) -> int:
     return sum(data) & 0xFF
 
-def mks_frame(addr: int, func: int, payload: bytes = b"") -> bytes:
+def mks_frame(addr: int, func: int, payload: bytes) -> bytes:
     base = bytes([0xFA, addr & 0xFF, func & 0xFF]) + payload
     return base + bytes([checksum8(base)])
 
-def mks_set_mode(ser: serial.Serial, addr: int, mode: int) -> None:
-    # 0x82: set work mode; SR_vFOC = 0x05
-    ser.write(mks_frame(addr, 0x82, bytes([mode & 0xFF])))
-    ser.flush()
-    time.sleep(INTER_FRAME_DELAY_S)
-
-def mks_enable(ser: serial.Serial, addr: int, en: bool) -> None:
-    # 0xF3: bus enable state
-    ser.write(mks_frame(addr, 0xF3, bytes([0x01 if en else 0x00])))
-    ser.flush()
-    time.sleep(INTER_FRAME_DELAY_S)
-
-def mks_speed_rpm(ser: serial.Serial, addr: int, rpm: int, acc: int) -> None:
-    """
-    0xF6 speed mode:
-    Byte4: bit7=dir, low nibble = speed[11:8]
-    Byte5: speed[7:0]
-    Byte6: acc
-    """
-    rpm = int(rpm)
-    rpm = max(0, min(3000, rpm))
-    acc = int(max(0, min(255, acc)))
-
-    direction = 0 if rpm == 0 else 0  # se define por signo fuera; aquí rpm ya es magnitud
-    b4 = ((direction & 0x01) << 7) | ((rpm >> 8) & 0x0F)
-    b5 = rpm & 0xFF
-    ser.write(mks_frame(addr, 0xF6, bytes([b4, b5, acc])))
+def mks_enable(ser: serial.Serial, addr: int, enable: bool) -> None:
+    # 0xF3 [01]=enable [00]=disable
+    ser.write(mks_frame(addr, 0xF3, bytes([0x01 if enable else 0x00])))
     ser.flush()
     time.sleep(INTER_FRAME_DELAY_S)
 
 def mks_speed_signed(ser: serial.Serial, addr: int, rpm_signed: float, acc: int) -> None:
-    rpm_signed_i = int(round(rpm_signed))
-    if rpm_signed_i == 0:
-        # stop suave/rápido: usando comando stop de speed-mode (F6 con speed=0)
-        b4, b5 = 0x00, 0x00
-        ser.write(mks_frame(addr, 0xF6, bytes([b4, b5, int(max(0, min(255, acc)))])))
+    """
+    0xF6 speed:
+      payload: [b4, b5, acc]
+      b4: bit7=dir (0 fwd, 1 rev), low nibble = speed[11:8]
+      b5: speed[7:0]
+    """
+    acc_i = int(max(0, min(255, int(acc))))
+
+    rpm_i = int(round(rpm_signed))
+    if rpm_i == 0:
+        # stop speed=0
+        ser.write(mks_frame(addr, 0xF6, bytes([0x00, 0x00, acc_i])))
         ser.flush()
         time.sleep(INTER_FRAME_DELAY_S)
         return
 
-    direction = 0 if rpm_signed_i > 0 else 1  # 0=forward, 1=reverse (según manual: bit7)
-    rpm_mag = min(3000, abs(rpm_signed_i))
+    direction = 0 if rpm_i > 0 else 1
+    rpm_mag = abs(rpm_i)
+    # límite de protocolo típico: 12 bits => 0..4095, pero limitamos a 3000 conservador
+    rpm_mag = max(0, min(3000, rpm_mag))
+
     b4 = ((direction & 0x01) << 7) | ((rpm_mag >> 8) & 0x0F)
     b5 = rpm_mag & 0xFF
-    ser.write(mks_frame(addr, 0xF6, bytes([b4, b5, int(max(0, min(255, acc)))])))
+    ser.write(mks_frame(addr, 0xF6, bytes([b4, b5, acc_i])))
     ser.flush()
     time.sleep(INTER_FRAME_DELAY_S)
 
 def motors_stop_and_disable(ser: serial.Serial) -> None:
+    # SOLO F6 (0) y F3 (disable)
     try:
-        # Paro (F6 speed=0) y luego disable (F3 00)
         for a in (MOTOR1_ADDR, MOTOR2_ADDR):
             ser.write(mks_frame(a, 0xF6, bytes([0x00, 0x00, 0x00])))
             ser.flush()
@@ -153,14 +147,13 @@ def motors_stop_and_disable(ser: serial.Serial) -> None:
 
 
 # ============================================================
-# MPU6050 (lectura mínima por I2C)
+# MPU6050 (I2C)
 # ============================================================
 
-# Registros
-PWR_MGMT_1 = 0x6B
-SMPLRT_DIV = 0x19
-CONFIG = 0x1A
-GYRO_CONFIG = 0x1B
+PWR_MGMT_1   = 0x6B
+SMPLRT_DIV   = 0x19
+CONFIG       = 0x1A
+GYRO_CONFIG  = 0x1B
 ACCEL_CONFIG = 0x1C
 ACCEL_XOUT_H = 0x3B
 
@@ -174,11 +167,8 @@ class MPU6050:
     def __init__(self, bus: SMBus, addr: int = MPU_ADDR):
         self.bus = bus
         self.addr = addr
-
-        # Escalas típicas: accel ±2g (16384 LSB/g), gyro ±250 dps (131 LSB/dps)
-        self.accel_lsb_per_g = 16384.0
-        self.gyro_lsb_per_dps = 131.0
-
+        self.accel_lsb_per_g = 16384.0  # ±2g
+        self.gyro_lsb_per_dps = 131.0   # ±250 dps
         self.gyro_bias_dps = 0.0
 
     def write_reg(self, reg: int, val: int) -> None:
@@ -191,9 +181,9 @@ class MPU6050:
         # Wake up
         self.write_reg(PWR_MGMT_1, 0x00)
         time.sleep(0.05)
-        # Sample rate / filtro (valores conservadores)
-        self.write_reg(SMPLRT_DIV, 0x04)   # Fs = 1kHz/(1+4)=200Hz (si DLPF activo)
-        self.write_reg(CONFIG, 0x03)       # DLPF_CFG=3 (filtro moderado)
+        # Ajustes conservadores
+        self.write_reg(SMPLRT_DIV, 0x04)   # ~200 Hz (con DLPF)
+        self.write_reg(CONFIG, 0x03)       # DLPF moderado
         self.write_reg(GYRO_CONFIG, 0x00)  # ±250 dps
         self.write_reg(ACCEL_CONFIG, 0x00) # ±2g
 
@@ -202,7 +192,6 @@ class MPU6050:
         ax = twos_complement_16(d[0], d[1])
         ay = twos_complement_16(d[2], d[3])
         az = twos_complement_16(d[4], d[5])
-        # temp = twos_complement_16(d[6], d[7])
         gx = twos_complement_16(d[8], d[9])
         gy = twos_complement_16(d[10], d[11])
         gz = twos_complement_16(d[12], d[13])
@@ -219,8 +208,8 @@ class MPU6050:
 
     def calibrate_gyro(self, seconds: float = 2.0, sample_hz: float = 200.0) -> None:
         n = max(1, int(seconds * sample_hz))
-        s = 0.0
         dt = 1.0 / sample_hz
+        s = 0.0
         for _ in range(n):
             _, _, _, gx_dps, _, _ = self.read()
             s += gx_dps
@@ -229,7 +218,7 @@ class MPU6050:
 
 
 # ============================================================
-# Kalman 1D (ángulo) típico para IMU
+# Kalman 1D
 # ============================================================
 
 class Kalman1D:
@@ -264,12 +253,13 @@ class Kalman1D:
         S = self.P00 + self.r_measure
         if S == 0.0:
             return self.angle
+
         K0 = self.P00 / S
         K1 = self.P10 / S
-
         y = new_angle - self.angle
+
         self.angle += K0 * y
-        self.bias += K1 * y
+        self.bias  += K1 * y
 
         P00_temp = self.P00
         P01_temp = self.P01
@@ -289,18 +279,16 @@ class PID:
     def __init__(self):
         self.integral = 0.0
         self.prev_err = 0.0
-        self.prev_t = None
 
     def reset(self):
         self.integral = 0.0
         self.prev_err = 0.0
-        self.prev_t = None
 
     def step(self, err: float, dt: float, kp: float, ki: float, kd: float, i_lim: float) -> float:
         if dt <= 0.0:
             return 0.0
+
         self.integral += err * dt
-        # anti-windup
         if self.integral > i_lim:
             self.integral = i_lim
         elif self.integral < -i_lim:
@@ -312,11 +300,12 @@ class PID:
 
 
 # ============================================================
-# Web (Flask) - sliders mínimos
+# Web (Flask) mínima
 # ============================================================
 
 app = Flask(__name__)
 _state_lock = threading.Lock()
+
 telemetry = {
     "angle_deg": 0.0,
     "gyro_dps": 0.0,
@@ -338,7 +327,7 @@ HTML = """
   </style>
 </head>
 <body>
-<h2>BalancingBot - Ajustes</h2>
+<h2>BalancingBot</h2>
 
 <div class="row"><div>Kp</div><input id="kp" type="range" min="0" max="200" step="0.1"><div><span id="kp_v"></span></div></div>
 <div class="row"><div>Ki</div><input id="ki" type="range" min="0" max="50" step="0.01"><div><span id="ki_v"></span></div></div>
@@ -369,9 +358,7 @@ HTML = """
 </p>
 
 <script>
-async function apiGet() {
-  const r = await fetch('/api/get'); return await r.json();
-}
+async function apiGet() { const r = await fetch('/api/get'); return await r.json(); }
 async function apiSet(k, v) {
   await fetch('/api/set', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({[k]:v})});
 }
@@ -379,8 +366,8 @@ function bindRange(id) {
   const el = document.getElementById(id);
   const out = document.getElementById(id+'_v');
   el.addEventListener('input', async () => {
-    const val = (el.type === 'range') ? parseFloat(el.value) : el.checked;
-    out.textContent = el.type==='range' ? el.value : (el.checked?'1':'0');
+    const val = parseFloat(el.value);
+    out.textContent = el.value;
     await apiSet(id, val);
   });
 }
@@ -396,6 +383,7 @@ async function init() {
   const ig = document.getElementById('invert_gyro');
   ig.checked = !!st.params.invert_gyro;
   ig.addEventListener('change', async ()=> apiSet('invert_gyro', ig.checked));
+
   setInterval(async ()=>{
     const t = await apiGet();
     document.getElementById('t_angle').textContent = t.telemetry.angle_deg.toFixed(2);
@@ -426,7 +414,6 @@ def api_set():
         for k, v in data.items():
             if not hasattr(P, k):
                 continue
-            # tipos básicos
             if k in ("max_rpm", "acc"):
                 setattr(P, k, int(v))
             elif k in ("invert_gyro",):
@@ -436,12 +423,12 @@ def api_set():
     return jsonify({"ok": True})
 
 def run_web():
-    # Acceso en: http://<ip_raspberry>:8080
+    # http://<ip_raspberry>:8080
     app.run(host="0.0.0.0", port=8080, debug=False, use_reloader=False)
 
 
 # ============================================================
-# MAIN LOOP
+# MAIN
 # ============================================================
 
 stop_flag = False
@@ -459,24 +446,21 @@ def clamp(x, lo, hi):
 def main():
     global stop_flag
 
-    # --- Web en hilo ---
-    t = threading.Thread(target=run_web, daemon=True)
-    t.start()
+    # Web thread
+    threading.Thread(target=run_web, daemon=True).start()
 
-    # --- I2C ---
+    # IMU
     bus = SMBus(I2C_BUS)
     mpu = MPU6050(bus, MPU_ADDR)
     mpu.init()
-
-    # Calibración gyro (robot quieto y vertical)
-    # OJO: aquí asumo que el eje X del gyro corresponde al eje de balanceo (pitch).
-    # Si no coincide, cambia el eje usado más abajo (gx/gy/gz).
+    # Calibración con robot quieto y vertical
     mpu.calibrate_gyro(seconds=2.0, sample_hz=200.0)
 
+    # Filtros/control
     kal = Kalman1D(P.q_angle, P.q_bias, P.r_measure)
     pid = PID()
 
-    # --- RS485 ---
+    # RS485
     ser = serial.Serial(
         RS485_PORT,
         RS485_BAUD,
@@ -489,19 +473,21 @@ def main():
     fallen = False
 
     try:
-        # Poner modo bus SR_vFOC y habilitar
-        for a in (MOTOR1_ADDR, MOTOR2_ADDR):
-            mks_set_mode(ser, a, 0x05)  # SR_vFOC
+        # SOLO: enable motores y mandar velocidad 0
         for a in (MOTOR1_ADDR, MOTOR2_ADDR):
             mks_enable(ser, a, True)
 
-        # Inicializa ángulo con acelerómetro
+        with _state_lock:
+            acc0 = int(P.acc)
+        for a in (MOTOR1_ADDR, MOTOR2_ADDR):
+            mks_speed_signed(ser, a, 0, acc0)
+
+        # Inicializa ángulo con acelerómetro (pitch asumido: X-Z)
         ax, ay, az, gx, gy, gz = mpu.read()
-        # Ángulo accel (pitch) en grados: atan2(ax, az)
         angle_acc = math.degrees(math.atan2(ax, az))
         kal.angle = angle_acc
 
-        dt_target = 1.0 / max(1.0, P.loop_hz)
+        dt_target = 1.0 / max(1.0, float(P.loop_hz))
         last = time.monotonic()
 
         while not stop_flag:
@@ -511,61 +497,51 @@ def main():
                 continue
             last = now
 
-            # IMU
             ax, ay, az, gx, gy, gz = mpu.read()
 
-            # Selección de ejes:
-            # - angle_acc: pitch estimado con accel (asumiendo X-Z)
-            # - gyro_rate: d(angle)/dt con gyro alrededor del eje de balanceo (asumo gx)
+            # Pitch por accel (X-Z). Cambia aquí si tu montaje usa otro eje.
             angle_acc = math.degrees(math.atan2(ax, az))
-            gyro_rate = gx - mpu.gyro_bias_dps
-            if P.invert_gyro:
-                gyro_rate = -gyro_rate
 
+            # Rate por gyro (asumo gx). Cambia aquí si tu eje de balanceo es otro.
+            gyro_rate = (gx - mpu.gyro_bias_dps)
             with _state_lock:
+                if P.invert_gyro:
+                    gyro_rate = -gyro_rate
                 kal.set_params(P.q_angle, P.q_bias, P.r_measure)
+                safe = float(P.safe_angle_deg)
+                max_rpm = int(P.max_rpm)
+                acc = int(P.acc)
+                kp, ki, kd = float(P.kp), float(P.ki), float(P.kd)
+                i_lim = float(P.integrator_limit)
 
             angle = kal.update(angle_acc, gyro_rate, dt)
 
-            # Seguridad caída
-            with _state_lock:
-                safe = float(P.safe_angle_deg)
             if abs(angle) > safe:
                 fallen = True
 
-            # Control
             out = 0.0
             if not fallen:
-                # setpoint = 0 deg
                 err = 0.0 - angle
-                with _state_lock:
-                    out = pid.step(err, dt, P.kp, P.ki, P.kd, P.integrator_limit)
-
-                # out -> RPM (mapeo directo mínimo). Ajusta Kp/Kd para que tenga escala razonable.
-                with _state_lock:
-                    max_rpm = int(P.max_rpm)
-                    acc = int(P.acc)
+                out = pid.step(err, dt, kp, ki, kd, i_lim)
                 out = clamp(out, -max_rpm, +max_rpm)
 
                 # Enviar a motores (uno invertido)
                 mks_speed_signed(ser, MOTOR1_ADDR, M1_SIGN * out, acc)
                 mks_speed_signed(ser, MOTOR2_ADDR, M2_SIGN * out, acc)
             else:
-                # Parar y deshabilitar
+                # SOLO F6=0 y F3=disable
                 motors_stop_and_disable(ser)
 
-            # Telemetría
             with _state_lock:
                 telemetry["angle_deg"] = float(angle)
                 telemetry["gyro_dps"] = float(gyro_rate)
                 telemetry["pid_out"] = float(out)
                 telemetry["fallen"] = bool(fallen)
-                telemetry["fallen"] = bool(fallen)
 
-            # Mantener frecuencia (sin deriva)
+            # mantener frecuencia
             elapsed = time.monotonic() - now
             sleep_s = dt_target - elapsed
-            if sleep_s > 0:
+            if sleep_s > 0.0:
                 time.sleep(sleep_s)
 
     finally:
@@ -580,6 +556,7 @@ def main():
                 bus.close()
             except Exception:
                 pass
+
 
 if __name__ == "__main__":
     main()
