@@ -1,20 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-BalancingBot mínimo con RESTRICCIÓN:
-- A los motores MKS SERVO42D por RS485 SOLO se les manda:
-  * ENABLE/DISABLE: 0xF3
-  * VELOCIDAD:      0xF6
-No se envía ninguna otra trama (ni 0x82, ni 0x8C, etc.)
-
-Incluye:
-- MPU6050 (GY-521) por I2C: init + calibración gyro al arrancar
-- Kalman 1D para ángulo
-- PID para mantener 0 grados
-- Web UI (Flask) para Kp/Ki/Kd, max_rpm, acc, límites, Kalman, invertir gyro
-- Seguridad: si |ángulo| > limite => F6=0 y F3=disable
-- En salida del programa: F6=0 y F3=disable siempre
-"""
 
 import math
 import time
@@ -25,21 +10,16 @@ from dataclasses import dataclass, asdict
 import serial
 from flask import Flask, request, jsonify
 
-try:
-    from smbus2 import SMBus
-except ImportError as e:
-    raise SystemExit("Falta smbus2. Instala: pip install smbus2") from e
+from smbus2 import SMBus
 
 
 # ============================================================
 # CONFIG HW
 # ============================================================
 
-# ---- I2C / MPU6050 ----
 I2C_BUS = 1
 MPU_ADDR = 0x68
 
-# ---- RS485 / MKS SERVO ----
 RS485_PORT = "/dev/ttyUSB0"
 RS485_BAUD = 38400
 RS485_TIMEOUT_S = 0.05
@@ -48,36 +28,33 @@ INTER_FRAME_DELAY_S = 0.002
 MOTOR1_ADDR = 0x01
 MOTOR2_ADDR = 0x02
 
-# Sentido por motor (uno invertido)
 M1_SIGN = +1
 M2_SIGN = -1
 
 
 # ============================================================
-# PARÁMETROS CONTROL (valores iniciales neutros)
+# PARÁMETROS
 # ============================================================
 
 @dataclass
 class Params:
     loop_hz: float = 200.0
 
-    # Seguridad
-    safe_angle_deg: float = 25.0
+    safe_angle_deg: float = 25.0          # umbral de caída
+    recover_angle_deg: float = 10.0       # umbral de rearme (histeresis)
+    recover_hold_s: float = 0.5           # tiempo estable para rearme
+    startup_grace_s: float = 1.0          # gracia tras arranque/calibración
 
-    # Salida motor
     max_rpm: int = 200
-    acc: int = 50  # 0..255
+    acc: int = 50
 
-    # PID
     kp: float = 25.0
     ki: float = 0.0
     kd: float = 0.8
     integrator_limit: float = 300.0
 
-    # IMU
-    invert_gyro: bool = False  # invierte signo del gyro usado en el eje de balanceo
+    invert_gyro: bool = False
 
-    # Kalman 1D
     q_angle: float = 0.001
     q_bias: float = 0.003
     r_measure: float = 0.03
@@ -87,7 +64,6 @@ P = Params()
 
 # ============================================================
 # MKS SERVO RS485 (SOLO F3 y F6)
-# CRC = checksum 8-bit (suma de bytes & 0xFF) del frame sin CRC
 # ============================================================
 
 def checksum8(data: bytes) -> int:
@@ -98,41 +74,31 @@ def mks_frame(addr: int, func: int, payload: bytes) -> bytes:
     return base + bytes([checksum8(base)])
 
 def mks_enable(ser: serial.Serial, addr: int, enable: bool) -> None:
-    # 0xF3 [01]=enable [00]=disable
     ser.write(mks_frame(addr, 0xF3, bytes([0x01 if enable else 0x00])))
     ser.flush()
     time.sleep(INTER_FRAME_DELAY_S)
 
 def mks_speed_signed(ser: serial.Serial, addr: int, rpm_signed: float, acc: int) -> None:
-    """
-    0xF6 speed:
-      payload: [b4, b5, acc]
-      b4: bit7=dir (0 fwd, 1 rev), low nibble = speed[11:8]
-      b5: speed[7:0]
-    """
     acc_i = int(max(0, min(255, int(acc))))
-
     rpm_i = int(round(rpm_signed))
+
     if rpm_i == 0:
-        # stop speed=0
         ser.write(mks_frame(addr, 0xF6, bytes([0x00, 0x00, acc_i])))
         ser.flush()
         time.sleep(INTER_FRAME_DELAY_S)
         return
 
     direction = 0 if rpm_i > 0 else 1
-    rpm_mag = abs(rpm_i)
-    # límite de protocolo típico: 12 bits => 0..4095, pero limitamos a 3000 conservador
-    rpm_mag = max(0, min(3000, rpm_mag))
+    rpm_mag = max(0, min(3000, abs(rpm_i)))
 
     b4 = ((direction & 0x01) << 7) | ((rpm_mag >> 8) & 0x0F)
     b5 = rpm_mag & 0xFF
+
     ser.write(mks_frame(addr, 0xF6, bytes([b4, b5, acc_i])))
     ser.flush()
     time.sleep(INTER_FRAME_DELAY_S)
 
 def motors_stop_and_disable(ser: serial.Serial) -> None:
-    # SOLO F6 (0) y F3 (disable)
     try:
         for a in (MOTOR1_ADDR, MOTOR2_ADDR):
             ser.write(mks_frame(a, 0xF6, bytes([0x00, 0x00, 0x00])))
@@ -147,7 +113,7 @@ def motors_stop_and_disable(ser: serial.Serial) -> None:
 
 
 # ============================================================
-# MPU6050 (I2C)
+# MPU6050
 # ============================================================
 
 PWR_MGMT_1   = 0x6B
@@ -167,8 +133,8 @@ class MPU6050:
     def __init__(self, bus: SMBus, addr: int = MPU_ADDR):
         self.bus = bus
         self.addr = addr
-        self.accel_lsb_per_g = 16384.0  # ±2g
-        self.gyro_lsb_per_dps = 131.0   # ±250 dps
+        self.accel_lsb_per_g = 16384.0
+        self.gyro_lsb_per_dps = 131.0
         self.gyro_bias_dps = 0.0
 
     def write_reg(self, reg: int, val: int) -> None:
@@ -178,14 +144,12 @@ class MPU6050:
         return bytes(self.bus.read_i2c_block_data(self.addr, start_reg, length))
 
     def init(self) -> None:
-        # Wake up
         self.write_reg(PWR_MGMT_1, 0x00)
         time.sleep(0.05)
-        # Ajustes conservadores
-        self.write_reg(SMPLRT_DIV, 0x04)   # ~200 Hz (con DLPF)
-        self.write_reg(CONFIG, 0x03)       # DLPF moderado
-        self.write_reg(GYRO_CONFIG, 0x00)  # ±250 dps
-        self.write_reg(ACCEL_CONFIG, 0x00) # ±2g
+        self.write_reg(SMPLRT_DIV, 0x04)
+        self.write_reg(CONFIG, 0x03)
+        self.write_reg(GYRO_CONFIG, 0x00)
+        self.write_reg(ACCEL_CONFIG, 0x00)
 
     def read(self):
         d = self.read_regs(ACCEL_XOUT_H, 14)
@@ -226,7 +190,6 @@ class Kalman1D:
         self.q_angle = q_angle
         self.q_bias = q_bias
         self.r_measure = r_measure
-
         self.angle = 0.0
         self.bias = 0.0
         self.P00 = 1.0
@@ -240,7 +203,6 @@ class Kalman1D:
         self.r_measure = float(r_measure)
 
     def update(self, new_angle: float, new_rate: float, dt: float) -> float:
-        # Predict
         rate = new_rate - self.bias
         self.angle += dt * rate
 
@@ -249,7 +211,6 @@ class Kalman1D:
         self.P10 -= dt * self.P11
         self.P11 += self.q_bias * dt
 
-        # Update
         S = self.P00 + self.r_measure
         if S == 0.0:
             return self.angle
@@ -287,46 +248,34 @@ class PID:
     def step(self, err: float, dt: float, kp: float, ki: float, kd: float, i_lim: float) -> float:
         if dt <= 0.0:
             return 0.0
-
         self.integral += err * dt
         if self.integral > i_lim:
             self.integral = i_lim
         elif self.integral < -i_lim:
             self.integral = -i_lim
-
         derr = (err - self.prev_err) / dt
         self.prev_err = err
         return kp*err + ki*self.integral + kd*derr
 
 
 # ============================================================
-# Web (Flask) mínima
+# Web
 # ============================================================
 
 app = Flask(__name__)
 _state_lock = threading.Lock()
 
-telemetry = {
-    "angle_deg": 0.0,
-    "gyro_dps": 0.0,
-    "pid_out": 0.0,
-    "fallen": False,
-}
+telemetry = {"angle_deg": 0.0, "gyro_dps": 0.0, "pid_out": 0.0, "fallen": False}
 
 HTML = """
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8"/>
-  <title>BalancingBot</title>
-  <style>
-    body { font-family: sans-serif; max-width: 900px; margin: 20px auto; }
-    .row { display: grid; grid-template-columns: 160px 1fr 90px; gap: 12px; align-items: center; margin: 8px 0; }
-    input[type=range]{ width: 100%; }
-    code { background:#f4f4f4; padding:2px 6px; border-radius:6px; }
-  </style>
-</head>
-<body>
+<!doctype html><html><head><meta charset="utf-8"/>
+<title>BalancingBot</title>
+<style>
+body{font-family:sans-serif;max-width:900px;margin:20px auto;}
+.row{display:grid;grid-template-columns:160px 1fr 90px;gap:12px;align-items:center;margin:8px 0;}
+input[type=range]{width:100%;}
+code{background:#f4f4f4;padding:2px 6px;border-radius:6px;}
+</style></head><body>
 <h2>BalancingBot</h2>
 
 <div class="row"><div>Kp</div><input id="kp" type="range" min="0" max="200" step="0.1"><div><span id="kp_v"></span></div></div>
@@ -334,68 +283,51 @@ HTML = """
 <div class="row"><div>Kd</div><input id="kd" type="range" min="0" max="50" step="0.01"><div><span id="kd_v"></span></div></div>
 
 <div class="row"><div>MAX RPM</div><input id="max_rpm" type="range" min="0" max="1000" step="1"><div><span id="max_rpm_v"></span></div></div>
-<div class="row"><div>ACC (0..255)</div><input id="acc" type="range" min="0" max="255" step="1"><div><span id="acc_v"></span></div></div>
+<div class="row"><div>ACC</div><input id="acc" type="range" min="0" max="255" step="1"><div><span id="acc_v"></span></div></div>
 
 <div class="row"><div>SAFE deg</div><input id="safe_angle_deg" type="range" min="5" max="60" step="1"><div><span id="safe_angle_deg_v"></span></div></div>
+<div class="row"><div>RECOVER deg</div><input id="recover_angle_deg" type="range" min="1" max="30" step="1"><div><span id="recover_angle_deg_v"></span></div></div>
+<div class="row"><div>REC HOLD s</div><input id="recover_hold_s" type="range" min="0.1" max="3.0" step="0.1"><div><span id="recover_hold_s_v"></span></div></div>
+<div class="row"><div>GRACE s</div><input id="startup_grace_s" type="range" min="0.0" max="5.0" step="0.1"><div><span id="startup_grace_s_v"></span></div></div>
 
 <h3>Kalman</h3>
 <div class="row"><div>Q_angle</div><input id="q_angle" type="range" min="0.0001" max="0.02" step="0.0001"><div><span id="q_angle_v"></span></div></div>
 <div class="row"><div>Q_bias</div><input id="q_bias" type="range" min="0.0001" max="0.02" step="0.0001"><div><span id="q_bias_v"></span></div></div>
 <div class="row"><div>R_measure</div><input id="r_measure" type="range" min="0.001" max="0.2" step="0.001"><div><span id="r_measure_v"></span></div></div>
 
-<div class="row">
-  <div>Invert gyro</div>
-  <input id="invert_gyro" type="checkbox">
-  <div></div>
-</div>
+<div class="row"><div>Invert gyro</div><input id="invert_gyro" type="checkbox"><div></div></div>
 
 <h3>Telemetría</h3>
 <p>
-  angle: <code id="t_angle">0</code> deg |
-  gyro: <code id="t_gyro">0</code> dps |
-  pid: <code id="t_pid">0</code> |
-  fallen: <code id="t_fallen">false</code>
+angle: <code id="t_angle">0</code> deg |
+gyro: <code id="t_gyro">0</code> dps |
+pid: <code id="t_pid">0</code> |
+fallen: <code id="t_fallen">false</code>
 </p>
 
 <script>
-async function apiGet() { const r = await fetch('/api/get'); return await r.json(); }
-async function apiSet(k, v) {
-  await fetch('/api/set', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({[k]:v})});
+async function apiGet(){const r=await fetch('/api/get');return await r.json();}
+async function apiSet(k,v){await fetch('/api/set',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({[k]:v})});}
+function bindRange(id){
+  const el=document.getElementById(id), out=document.getElementById(id+'_v');
+  el.addEventListener('input', async()=>{ out.textContent=el.value; await apiSet(id, parseFloat(el.value)); });
 }
-function bindRange(id) {
-  const el = document.getElementById(id);
-  const out = document.getElementById(id+'_v');
-  el.addEventListener('input', async () => {
-    const val = parseFloat(el.value);
-    out.textContent = el.value;
-    await apiSet(id, val);
-  });
-}
-async function init() {
-  const st = await apiGet();
-  const keys = ['kp','ki','kd','max_rpm','acc','safe_angle_deg','q_angle','q_bias','r_measure'];
-  for (const k of keys) {
-    const el = document.getElementById(k);
-    el.value = st.params[k];
-    document.getElementById(k+'_v').textContent = el.value;
-    bindRange(k);
-  }
-  const ig = document.getElementById('invert_gyro');
-  ig.checked = !!st.params.invert_gyro;
-  ig.addEventListener('change', async ()=> apiSet('invert_gyro', ig.checked));
-
-  setInterval(async ()=>{
-    const t = await apiGet();
-    document.getElementById('t_angle').textContent = t.telemetry.angle_deg.toFixed(2);
-    document.getElementById('t_gyro').textContent  = t.telemetry.gyro_dps.toFixed(2);
-    document.getElementById('t_pid').textContent   = t.telemetry.pid_out.toFixed(2);
-    document.getElementById('t_fallen').textContent= String(t.telemetry.fallen);
-  }, 200);
+async function init(){
+  const st=await apiGet();
+  const keys=['kp','ki','kd','max_rpm','acc','safe_angle_deg','recover_angle_deg','recover_hold_s','startup_grace_s','q_angle','q_bias','r_measure'];
+  for(const k of keys){ const el=document.getElementById(k); el.value=st.params[k]; document.getElementById(k+'_v').textContent=el.value; bindRange(k); }
+  const ig=document.getElementById('invert_gyro'); ig.checked=!!st.params.invert_gyro;
+  ig.addEventListener('change', async()=> apiSet('invert_gyro', ig.checked));
+  setInterval(async()=>{
+    const t=await apiGet();
+    document.getElementById('t_angle').textContent=t.telemetry.angle_deg.toFixed(2);
+    document.getElementById('t_gyro').textContent=t.telemetry.gyro_dps.toFixed(2);
+    document.getElementById('t_pid').textContent=t.telemetry.pid_out.toFixed(2);
+    document.getElementById('t_fallen').textContent=String(t.telemetry.fallen);
+  },200);
 }
 init();
-</script>
-</body>
-</html>
+</script></body></html>
 """
 
 @app.get("/")
@@ -423,7 +355,6 @@ def api_set():
     return jsonify({"ok": True})
 
 def run_web():
-    # http://<ip_raspberry>:8080
     app.run(host="0.0.0.0", port=8080, debug=False, use_reloader=False)
 
 
@@ -443,27 +374,26 @@ signal.signal(signal.SIGTERM, _sig_handler)
 def clamp(x, lo, hi):
     return lo if x < lo else hi if x > hi else x
 
+def angle_from_accel_pitch(ax_g: float, ay_g: float, az_g: float) -> float:
+    # Pitch robusto: atan2(ax, sqrt(ay^2 + az^2))
+    denom = math.sqrt(ay_g*ay_g + az_g*az_g)
+    return math.degrees(math.atan2(ax_g, denom))
+
 def main():
     global stop_flag
 
-    # Web thread
     threading.Thread(target=run_web, daemon=True).start()
 
-    # IMU
     bus = SMBus(I2C_BUS)
     mpu = MPU6050(bus, MPU_ADDR)
     mpu.init()
-    # Calibración con robot quieto y vertical
     mpu.calibrate_gyro(seconds=2.0, sample_hz=200.0)
 
-    # Filtros/control
     kal = Kalman1D(P.q_angle, P.q_bias, P.r_measure)
     pid = PID()
 
-    # RS485
     ser = serial.Serial(
-        RS485_PORT,
-        RS485_BAUD,
+        RS485_PORT, RS485_BAUD,
         timeout=RS485_TIMEOUT_S,
         bytesize=serial.EIGHTBITS,
         parity=serial.PARITY_NONE,
@@ -471,9 +401,11 @@ def main():
     )
 
     fallen = False
+    grace_start = time.monotonic()
+    recover_ok_since = None
 
     try:
-        # SOLO: enable motores y mandar velocidad 0
+        # SOLO enable + velocidad 0
         for a in (MOTOR1_ADDR, MOTOR2_ADDR):
             mks_enable(ser, a, True)
 
@@ -482,9 +414,8 @@ def main():
         for a in (MOTOR1_ADDR, MOTOR2_ADDR):
             mks_speed_signed(ser, a, 0, acc0)
 
-        # Inicializa ángulo con acelerómetro (pitch asumido: X-Z)
         ax, ay, az, gx, gy, gz = mpu.read()
-        angle_acc = math.degrees(math.atan2(ax, az))
+        angle_acc = angle_from_accel_pitch(ax, ay, az)
         kal.angle = angle_acc
 
         dt_target = 1.0 / max(1.0, float(P.loop_hz))
@@ -498,17 +429,21 @@ def main():
             last = now
 
             ax, ay, az, gx, gy, gz = mpu.read()
+            angle_acc = angle_from_accel_pitch(ax, ay, az)
 
-            # Pitch por accel (X-Z). Cambia aquí si tu montaje usa otro eje.
-            angle_acc = math.degrees(math.atan2(ax, az))
-
-            # Rate por gyro (asumo gx). Cambia aquí si tu eje de balanceo es otro.
-            gyro_rate = (gx - mpu.gyro_bias_dps)
             with _state_lock:
                 if P.invert_gyro:
-                    gyro_rate = -gyro_rate
+                    gyro_rate = -(gx - mpu.gyro_bias_dps)
+                else:
+                    gyro_rate = (gx - mpu.gyro_bias_dps)
+
                 kal.set_params(P.q_angle, P.q_bias, P.r_measure)
+
                 safe = float(P.safe_angle_deg)
+                rec  = float(P.recover_angle_deg)
+                hold = float(P.recover_hold_s)
+                grace = float(P.startup_grace_s)
+
                 max_rpm = int(P.max_rpm)
                 acc = int(P.acc)
                 kp, ki, kd = float(P.kp), float(P.ki), float(P.kd)
@@ -516,21 +451,42 @@ def main():
 
             angle = kal.update(angle_acc, gyro_rate, dt)
 
-            if abs(angle) > safe:
-                fallen = True
+            # ---- Gestión de caída con gracia + recuperación ----
+            in_grace = (now - grace_start) < grace
+
+            if not fallen:
+                if (not in_grace) and (abs(angle) > safe):
+                    fallen = True
+                    recover_ok_since = None
+                    pid.reset()
+                    # parar y deshabilitar inmediato
+                    motors_stop_and_disable(ser)
+            else:
+                # fallen=True: mirar si vuelve a estar "estable" para rearme
+                if abs(angle) < rec:
+                    if recover_ok_since is None:
+                        recover_ok_since = now
+                    elif (now - recover_ok_since) >= hold:
+                        # rearme
+                        fallen = False
+                        recover_ok_since = None
+                        pid.reset()
+                        grace_start = now  # pequeña gracia tras rearme
+                        # SOLO enable + velocidad 0
+                        for a in (MOTOR1_ADDR, MOTOR2_ADDR):
+                            mks_enable(ser, a, True)
+                        for a in (MOTOR1_ADDR, MOTOR2_ADDR):
+                            mks_speed_signed(ser, a, 0, acc)
+                else:
+                    recover_ok_since = None
 
             out = 0.0
             if not fallen:
                 err = 0.0 - angle
                 out = pid.step(err, dt, kp, ki, kd, i_lim)
                 out = clamp(out, -max_rpm, +max_rpm)
-
-                # Enviar a motores (uno invertido)
                 mks_speed_signed(ser, MOTOR1_ADDR, M1_SIGN * out, acc)
                 mks_speed_signed(ser, MOTOR2_ADDR, M2_SIGN * out, acc)
-            else:
-                # SOLO F6=0 y F3=disable
-                motors_stop_and_disable(ser)
 
             with _state_lock:
                 telemetry["angle_deg"] = float(angle)
@@ -538,7 +494,6 @@ def main():
                 telemetry["pid_out"] = float(out)
                 telemetry["fallen"] = bool(fallen)
 
-            # mantener frecuencia
             elapsed = time.monotonic() - now
             sleep_s = dt_target - elapsed
             if sleep_s > 0.0:
