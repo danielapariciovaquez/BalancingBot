@@ -1,228 +1,243 @@
 #!/usr/bin/env python3
-import time
-import sys
+# -*- coding: utf-8 -*-
+"""
+BalancingBot mínimo (Raspberry Pi):
+- IMU GY-521 (MPU6050) por I2C
+- 2x MKS SERVO42D por RS485 (pyserial), con un motor invertido
+- Fusión Kalman 1D (ángulo) + PID -> velocidad (RPM) en modo SR_vFOC
+- Interfaz web mínima (Flask) para ajustar parámetros en caliente
+- Seguridad: si se cae (|ángulo| > limite), para y deshabilita motores
+"""
+
 import math
-import serial
+import time
+import signal
 import threading
-import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 
-# ===================== RS485 / MOTORES =====================
-PORT = "/dev/ttyUSB0"
-BAUD = 38400
-TIMEOUT_S = 0.05
-
-ADDR_LEFT  = 0x01
-ADDR_RIGHT = 0x02
-
-MAX_RPM = 300
-ACC = 255
-
-INTER_FRAME_DELAY_S = 0.004
-ENABLE_RETRIES = 2
-ENABLE_RETRY_DELAY_S = 0.02
-
-INVERT_LEFT  = False
-INVERT_RIGHT = True
-# ===========================================================
-
-# ===================== CONTROL =====================
-UPDATE_HZ = 150
-DT_MAX = 0.05
-ANGLE_CUTOFF_DEG = 35.0
-SETPOINT_DEG = 0.0
-
-MAX_RPM_STEP_PER_S = 700.0
-BAL_MAX_RPM_DEFAULT = 120.0
-I_LIM_DEFAULT = 200.0
-# ===================================================
-
-# ===================== MPU6050 (GY-521) =====================
-I2C_BUS = 1
-MPU_ADDR = 0x68
-
-REG_PWR_MGMT_1   = 0x6B
-REG_ACCEL_XOUT_H = 0x3B
-REG_GYRO_YOUT_H  = 0x45
-
-ACC_LSB_PER_G = 16384.0
-GYRO_LSB_PER_DPS = 131.0
-
-CAL_SAMPLES_GYRO  = 800
-CAL_SAMPLES_ACCEL = 200
-# ===========================================================
-
-# ===================== WEB =====================
-WEB_HOST = "0.0.0.0"
-WEB_PORT = 8000
-
-KP_RANGE = (0.0, 80.0)
-KI_RANGE = (0.0, 20.0)
-KD_RANGE = (0.0, 50.0)
-
-BAL_MAX_RPM_RANGE = (0.0, 300.0)
-SLEW_RANGE = (0.0, 6000.0)
-I_LIM_RANGE = (0.0, 2000.0)
-
-ACC_TAU_RANGE = (0.0, 0.30)
-GYRO_TAU_RANGE = (0.0, 0.30)
-
-K_QA_RANGE = (1e-6, 5e-2)
-K_QB_RANGE = (1e-6, 5e-1)
-K_RM_RANGE = (1e-4, 2e-1)
-# ===========================================================
-
-# ---- Tolerancia a fallos IMU ----
-IMU_MAX_CONSECUTIVE_ERRORS = 20   # 20 iteraciones seguidas con error
-IMU_ERROR_MOTOR_ZERO = True       # en error IMU: manda 0 rpm (seguro)
-IMU_ERROR_SLEEP_S = 0.002         # pequeña pausa para no quemar I2C
-# --------------------------------
+import serial
+from flask import Flask, request, jsonify
 
 try:
     from smbus2 import SMBus
-except ImportError:
-    try:
-        from smbus import SMBus  # type: ignore
-    except ImportError:
-        SMBus = None
-
-try:
-    from flask import Flask, request, jsonify
-except ImportError:
-    Flask = None
+except ImportError as e:
+    raise SystemExit("Falta smbus2. Instala: pip install smbus2") from e
 
 
-def clamp(x: float, lo: float, hi: float) -> float:
-    return lo if x < lo else hi if x > hi else x
+# ============================================================
+# CONFIG HW
+# ============================================================
+
+# ---- I2C / MPU6050 ----
+I2C_BUS = 1
+MPU_ADDR = 0x68
+
+# ---- RS485 / MKS SERVO ----
+RS485_PORT = "/dev/ttyUSB0"
+RS485_BAUD = 38400
+RS485_TIMEOUT_S = 0.05
+INTER_FRAME_DELAY_S = 0.002  # pequeño; evita saturar el bus
+
+MOTOR1_ADDR = 0x01
+MOTOR2_ADDR = 0x02
+
+# Si un motor está montado al revés, ajusta signos aquí
+M1_SIGN = +1
+M2_SIGN = -1
+
+# ============================================================
+# PARÁMETROS CONTROL (valores iniciales conservadores)
+# ============================================================
+
+@dataclass
+class Params:
+    # Loop
+    loop_hz: float = 200.0
+
+    # Seguridad
+    safe_angle_deg: float = 25.0
+
+    # Salida a motor
+    max_rpm: int = 200        # límite absoluto de RPM
+    acc: int = 50             # 0..255 (MKS); aceleración en modo velocidad
+
+    # PID (sobre ángulo)
+    kp: float = 25.0
+    ki: float = 0.0
+    kd: float = 0.8
+    integrator_limit: float = 300.0  # anti-windup (en unidades de salida PID)
+
+    # IMU: inversión opcional de gyro (según montaje)
+    invert_gyro: bool = False
+
+    # Kalman 1D (ángulo)
+    q_angle: float = 0.001
+    q_bias: float = 0.003
+    r_measure: float = 0.03
+
+P = Params()
+
+
+# ============================================================
+# UTILIDADES MKS SERVO RS485 (checksum 8-bit = suma & 0xFF)
+# ============================================================
 
 def checksum8(data: bytes) -> int:
     return sum(data) & 0xFF
 
-def frame(addr: int, cmd: int, payload: bytes = b"") -> bytes:
-    base = bytes([0xFA, addr & 0xFF, cmd & 0xFF]) + payload
+def mks_frame(addr: int, func: int, payload: bytes = b"") -> bytes:
+    base = bytes([0xFA, addr & 0xFF, func & 0xFF]) + payload
     return base + bytes([checksum8(base)])
 
-def cmd_enable(addr: int, en: bool) -> bytes:
-    return frame(addr, 0xF3, bytes([0x01 if en else 0x00]))
-
-def cmd_speed(addr: int, rpm: int, acc: int) -> bytes:
-    acc_u8 = int(clamp(acc, 0, 255))
-    if rpm >= 0:
-        direction_bit = 0
-        speed = rpm
-    else:
-        direction_bit = 1
-        speed = -rpm
-
-    speed = int(clamp(speed, 0, MAX_RPM))
-    b4 = ((direction_bit & 0x01) << 7) | ((speed >> 8) & 0x0F)
-    b5 = speed & 0xFF
-    payload = bytes([b4, b5, acc_u8])
-    return frame(addr, 0xF6, payload)
-
-@dataclass
-class MotorCmd:
-    left_rpm: int
-    right_rpm: int
-
-def open_serial() -> serial.Serial:
-    ser = serial.Serial(
-        port=PORT,
-        baudrate=BAUD,
-        bytesize=serial.EIGHTBITS,
-        parity=serial.PARITY_NONE,
-        stopbits=serial.STOPBITS_ONE,
-        timeout=TIMEOUT_S,
-        write_timeout=TIMEOUT_S,
-    )
-    ser.reset_input_buffer()
-    ser.reset_output_buffer()
-    return ser
-
-def send(ser: serial.Serial, data: bytes) -> None:
-    ser.write(data)
+def mks_set_mode(ser: serial.Serial, addr: int, mode: int) -> None:
+    # 0x82: set work mode; SR_vFOC = 0x05
+    ser.write(mks_frame(addr, 0x82, bytes([mode & 0xFF])))
     ser.flush()
+    time.sleep(INTER_FRAME_DELAY_S)
 
-def send_paced(ser: serial.Serial, data: bytes, delay_s: float = INTER_FRAME_DELAY_S) -> None:
-    send(ser, data)
-    if delay_s > 0:
-        time.sleep(delay_s)
+def mks_enable(ser: serial.Serial, addr: int, en: bool) -> None:
+    # 0xF3: bus enable state
+    ser.write(mks_frame(addr, 0xF3, bytes([0x01 if en else 0x00])))
+    ser.flush()
+    time.sleep(INTER_FRAME_DELAY_S)
 
-def send_enable_robust(ser: serial.Serial, addr: int, en: bool) -> None:
-    pkt = cmd_enable(addr, en)
-    for i in range(ENABLE_RETRIES):
-        send_paced(ser, pkt, INTER_FRAME_DELAY_S)
-        if i != ENABLE_RETRIES - 1:
-            time.sleep(ENABLE_RETRY_DELAY_S)
+def mks_speed_rpm(ser: serial.Serial, addr: int, rpm: int, acc: int) -> None:
+    """
+    0xF6 speed mode:
+    Byte4: bit7=dir, low nibble = speed[11:8]
+    Byte5: speed[7:0]
+    Byte6: acc
+    """
+    rpm = int(rpm)
+    rpm = max(0, min(3000, rpm))
+    acc = int(max(0, min(255, acc)))
 
-def motors_from_balance(base_rpm: float) -> MotorCmd:
-    left_rpm = int(round(clamp(base_rpm, -MAX_RPM, MAX_RPM)))
-    right_rpm = int(round(clamp(base_rpm, -MAX_RPM, MAX_RPM)))
-    if INVERT_LEFT:
-        left_rpm = -left_rpm
-    if INVERT_RIGHT:
-        right_rpm = -right_rpm
-    return MotorCmd(left_rpm=left_rpm, right_rpm=right_rpm)
+    direction = 0 if rpm == 0 else 0  # se define por signo fuera; aquí rpm ya es magnitud
+    b4 = ((direction & 0x01) << 7) | ((rpm >> 8) & 0x0F)
+    b5 = rpm & 0xFF
+    ser.write(mks_frame(addr, 0xF6, bytes([b4, b5, acc])))
+    ser.flush()
+    time.sleep(INTER_FRAME_DELAY_S)
 
-def i2c_require():
-    if SMBus is None:
-        raise RuntimeError("No se encontró smbus2/smbus. Instala: pip3 install smbus2")
+def mks_speed_signed(ser: serial.Serial, addr: int, rpm_signed: float, acc: int) -> None:
+    rpm_signed_i = int(round(rpm_signed))
+    if rpm_signed_i == 0:
+        # stop suave/rápido: usando comando stop de speed-mode (F6 con speed=0)
+        b4, b5 = 0x00, 0x00
+        ser.write(mks_frame(addr, 0xF6, bytes([b4, b5, int(max(0, min(255, acc)))])))
+        ser.flush()
+        time.sleep(INTER_FRAME_DELAY_S)
+        return
 
-def web_require():
-    if Flask is None:
-        raise RuntimeError("No se encontró Flask. Instala: pip3 install flask")
+    direction = 0 if rpm_signed_i > 0 else 1  # 0=forward, 1=reverse (según manual: bit7)
+    rpm_mag = min(3000, abs(rpm_signed_i))
+    b4 = ((direction & 0x01) << 7) | ((rpm_mag >> 8) & 0x0F)
+    b5 = rpm_mag & 0xFF
+    ser.write(mks_frame(addr, 0xF6, bytes([b4, b5, int(max(0, min(255, acc)))])))
+    ser.flush()
+    time.sleep(INTER_FRAME_DELAY_S)
 
-def read_i16_be(bus: SMBus, addr: int, reg_hi: int) -> int:
-    hi = bus.read_byte_data(addr, reg_hi)
-    lo = bus.read_byte_data(addr, reg_hi + 1)
-    v = (hi << 8) | lo
+def motors_stop_and_disable(ser: serial.Serial) -> None:
+    try:
+        # Paro (F6 speed=0) y luego disable (F3 00)
+        for a in (MOTOR1_ADDR, MOTOR2_ADDR):
+            ser.write(mks_frame(a, 0xF6, bytes([0x00, 0x00, 0x00])))
+            ser.flush()
+            time.sleep(INTER_FRAME_DELAY_S)
+        for a in (MOTOR1_ADDR, MOTOR2_ADDR):
+            ser.write(mks_frame(a, 0xF3, bytes([0x00])))
+            ser.flush()
+            time.sleep(INTER_FRAME_DELAY_S)
+    except Exception:
+        pass
+
+
+# ============================================================
+# MPU6050 (lectura mínima por I2C)
+# ============================================================
+
+# Registros
+PWR_MGMT_1 = 0x6B
+SMPLRT_DIV = 0x19
+CONFIG = 0x1A
+GYRO_CONFIG = 0x1B
+ACCEL_CONFIG = 0x1C
+ACCEL_XOUT_H = 0x3B
+
+def twos_complement_16(msb: int, lsb: int) -> int:
+    v = (msb << 8) | lsb
     if v & 0x8000:
         v -= 0x10000
     return v
 
-def mpu_wake(bus: SMBus) -> None:
-    bus.write_byte_data(MPU_ADDR, REG_PWR_MGMT_1, 0x00)
-    time.sleep(0.05)
+class MPU6050:
+    def __init__(self, bus: SMBus, addr: int = MPU_ADDR):
+        self.bus = bus
+        self.addr = addr
 
-def read_accel_gyro(bus: SMBus):
-    ax = read_i16_be(bus, MPU_ADDR, REG_ACCEL_XOUT_H)
-    az = read_i16_be(bus, MPU_ADDR, REG_ACCEL_XOUT_H + 4)
-    gy = read_i16_be(bus, MPU_ADDR, REG_GYRO_YOUT_H)
-    return ax, az, gy
+        # Escalas típicas: accel ±2g (16384 LSB/g), gyro ±250 dps (131 LSB/dps)
+        self.accel_lsb_per_g = 16384.0
+        self.gyro_lsb_per_dps = 131.0
 
-def accel_angle_deg_from_ax_az(ax_raw: int, az_raw: int) -> float:
-    ax_g = ax_raw / ACC_LSB_PER_G
-    az_g = az_raw / ACC_LSB_PER_G
-    ang = math.degrees(math.atan2(ax_g, az_g))
-    return -ang
+        self.gyro_bias_dps = 0.0
 
-def calibrate_gyro_y_bias(bus: SMBus) -> float:
-    s = 0.0
-    for _ in range(CAL_SAMPLES_GYRO):
-        _, _, gy_raw = read_accel_gyro(bus)
-        s += (gy_raw / GYRO_LSB_PER_DPS)
-        time.sleep(0.001)
-    return s / float(CAL_SAMPLES_GYRO)
+    def write_reg(self, reg: int, val: int) -> None:
+        self.bus.write_byte_data(self.addr, reg, val & 0xFF)
 
-def calibrate_accel_angle_zero(bus: SMBus) -> float:
-    s = 0.0
-    for _ in range(CAL_SAMPLES_ACCEL):
-        ax, az, _ = read_accel_gyro(bus)
-        s += accel_angle_deg_from_ax_az(ax, az)
-        time.sleep(0.001)
-    return s / float(CAL_SAMPLES_ACCEL)
+    def read_regs(self, start_reg: int, length: int) -> bytes:
+        return bytes(self.bus.read_i2c_block_data(self.addr, start_reg, length))
 
-def lpf_update(x_f: float, x: float, tau: float, dt: float) -> float:
-    if tau <= 0.0 or dt <= 0.0:
-        return x
-    a = dt / (tau + dt)
-    return x_f + a * (x - x_f)
+    def init(self) -> None:
+        # Wake up
+        self.write_reg(PWR_MGMT_1, 0x00)
+        time.sleep(0.05)
+        # Sample rate / filtro (valores conservadores)
+        self.write_reg(SMPLRT_DIV, 0x04)   # Fs = 1kHz/(1+4)=200Hz (si DLPF activo)
+        self.write_reg(CONFIG, 0x03)       # DLPF_CFG=3 (filtro moderado)
+        self.write_reg(GYRO_CONFIG, 0x00)  # ±250 dps
+        self.write_reg(ACCEL_CONFIG, 0x00) # ±2g
+
+    def read(self):
+        d = self.read_regs(ACCEL_XOUT_H, 14)
+        ax = twos_complement_16(d[0], d[1])
+        ay = twos_complement_16(d[2], d[3])
+        az = twos_complement_16(d[4], d[5])
+        # temp = twos_complement_16(d[6], d[7])
+        gx = twos_complement_16(d[8], d[9])
+        gy = twos_complement_16(d[10], d[11])
+        gz = twos_complement_16(d[12], d[13])
+
+        ax_g = ax / self.accel_lsb_per_g
+        ay_g = ay / self.accel_lsb_per_g
+        az_g = az / self.accel_lsb_per_g
+
+        gx_dps = gx / self.gyro_lsb_per_dps
+        gy_dps = gy / self.gyro_lsb_per_dps
+        gz_dps = gz / self.gyro_lsb_per_dps
+
+        return ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps
+
+    def calibrate_gyro(self, seconds: float = 2.0, sample_hz: float = 200.0) -> None:
+        n = max(1, int(seconds * sample_hz))
+        s = 0.0
+        dt = 1.0 / sample_hz
+        for _ in range(n):
+            _, _, _, gx_dps, _, _ = self.read()
+            s += gx_dps
+            time.sleep(dt)
+        self.gyro_bias_dps = s / n
+
+
+# ============================================================
+# Kalman 1D (ángulo) típico para IMU
+# ============================================================
 
 class Kalman1D:
-    def __init__(self, q_angle=0.001, q_bias=0.003, r_measure=0.03):
-        self.q_angle = float(q_angle)
-        self.q_bias = float(q_bias)
-        self.r_measure = float(r_measure)
+    def __init__(self, q_angle: float, q_bias: float, r_measure: float):
+        self.q_angle = q_angle
+        self.q_bias = q_bias
+        self.r_measure = r_measure
+
         self.angle = 0.0
         self.bias = 0.0
         self.P00 = 1.0
@@ -230,356 +245,341 @@ class Kalman1D:
         self.P10 = 0.0
         self.P11 = 1.0
 
-    def set_angle(self, angle_deg: float):
-        self.angle = float(angle_deg)
-
-    def set_params(self, q_angle: float, q_bias: float, r_measure: float):
+    def set_params(self, q_angle: float, q_bias: float, r_measure: float) -> None:
         self.q_angle = float(q_angle)
         self.q_bias = float(q_bias)
         self.r_measure = float(r_measure)
 
-    def update(self, meas_angle_deg: float, gyro_rate_dps: float, dt: float) -> float:
-        rate = gyro_rate_dps - self.bias
+    def update(self, new_angle: float, new_rate: float, dt: float) -> float:
+        # Predict
+        rate = new_rate - self.bias
         self.angle += dt * rate
 
-        P00 = self.P00 + dt * (dt*self.P11 - self.P01 - self.P10 + self.q_angle)
-        P01 = self.P01 - dt * self.P11
-        P10 = self.P10 - dt * self.P11
-        P11 = self.P11 + self.q_bias * dt
-        self.P00, self.P01, self.P10, self.P11 = P00, P01, P10, P11
+        self.P00 += dt * (dt*self.P11 - self.P01 - self.P10 + self.q_angle)
+        self.P01 -= dt * self.P11
+        self.P10 -= dt * self.P11
+        self.P11 += self.q_bias * dt
 
-        y = meas_angle_deg - self.angle
+        # Update
         S = self.P00 + self.r_measure
+        if S == 0.0:
+            return self.angle
         K0 = self.P00 / S
         K1 = self.P10 / S
 
-        angle_new = self.angle + K0 * y
-        bias_new  = self.bias  + K1 * y
+        y = new_angle - self.angle
+        self.angle += K0 * y
+        self.bias += K1 * y
 
-        P00_old, P01_old, P10_old, P11_old = self.P00, self.P01, self.P10, self.P11
-        self.P00 = P00_old - K0 * P00_old
-        self.P01 = P01_old - K0 * P01_old
-        self.P10 = P10_old - K1 * P00_old
-        self.P11 = P11_old - K1 * P01_old
+        P00_temp = self.P00
+        P01_temp = self.P01
+        self.P00 -= K0 * P00_temp
+        self.P01 -= K0 * P01_temp
+        self.P10 -= K1 * P00_temp
+        self.P11 -= K1 * P01_temp
 
-        self.angle = angle_new
-        self.bias = bias_new
         return self.angle
 
-class Params:
+
+# ============================================================
+# PID
+# ============================================================
+
+class PID:
     def __init__(self):
-        self.kp = 18.0
-        self.ki = 0.0
-        self.kd = 0.9
+        self.integral = 0.0
+        self.prev_err = 0.0
+        self.prev_t = None
 
-        self.i_lim = I_LIM_DEFAULT
-        self.bal_max_rpm = BAL_MAX_RPM_DEFAULT
-        self.max_rpm_step = MAX_RPM_STEP_PER_S
+    def reset(self):
+        self.integral = 0.0
+        self.prev_err = 0.0
+        self.prev_t = None
 
-        self.acc_tau = 0.03
-        self.gyro_tau = 0.02
+    def step(self, err: float, dt: float, kp: float, ki: float, kd: float, i_lim: float) -> float:
+        if dt <= 0.0:
+            return 0.0
+        self.integral += err * dt
+        # anti-windup
+        if self.integral > i_lim:
+            self.integral = i_lim
+        elif self.integral < -i_lim:
+            self.integral = -i_lim
 
-        self.k_q_angle = 0.001
-        self.k_q_bias = 0.003
-        self.k_r_meas = 0.03
+        derr = (err - self.prev_err) / dt
+        self.prev_err = err
+        return kp*err + ki*self.integral + kd*derr
 
-        self.invert_gyro = False
 
-param_lock = threading.Lock()
-params = Params()
+# ============================================================
+# Web (Flask) - sliders mínimos
+# ============================================================
 
-def get_params():
-    with param_lock:
-        return {
-            "kp": params.kp, "ki": params.ki, "kd": params.kd,
-            "i_lim": params.i_lim,
-            "bal_max_rpm": params.bal_max_rpm,
-            "max_rpm_step": params.max_rpm_step,
-            "acc_tau": params.acc_tau, "gyro_tau": params.gyro_tau,
-            "k_q_angle": params.k_q_angle, "k_q_bias": params.k_q_bias, "k_r_meas": params.k_r_meas,
-            "invert_gyro": params.invert_gyro,
-        }
+app = Flask(__name__)
+_state_lock = threading.Lock()
+telemetry = {
+    "angle_deg": 0.0,
+    "gyro_dps": 0.0,
+    "pid_out": 0.0,
+    "fallen": False,
+}
 
-def set_params(d: dict):
-    with param_lock:
-        for k in ("kp","ki","kd","i_lim","bal_max_rpm","max_rpm_step","acc_tau","gyro_tau","k_q_angle","k_q_bias","k_r_meas"):
-            if k in d:
-                setattr(params, k, float(d[k]))
-        if "invert_gyro" in d:
-            params.invert_gyro = bool(d["invert_gyro"])
+HTML = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>BalancingBot</title>
+  <style>
+    body { font-family: sans-serif; max-width: 900px; margin: 20px auto; }
+    .row { display: grid; grid-template-columns: 160px 1fr 90px; gap: 12px; align-items: center; margin: 8px 0; }
+    input[type=range]{ width: 100%; }
+    code { background:#f4f4f4; padding:2px 6px; border-radius:6px; }
+  </style>
+</head>
+<body>
+<h2>BalancingBot - Ajustes</h2>
 
-def start_web_server():
-    web_require()
-    app = Flask(__name__)
+<div class="row"><div>Kp</div><input id="kp" type="range" min="0" max="200" step="0.1"><div><span id="kp_v"></span></div></div>
+<div class="row"><div>Ki</div><input id="ki" type="range" min="0" max="50" step="0.01"><div><span id="ki_v"></span></div></div>
+<div class="row"><div>Kd</div><input id="kd" type="range" min="0" max="50" step="0.01"><div><span id="kd_v"></span></div></div>
 
-    HTML = f"""<!doctype html><html lang="es"><head>
-<meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>Balance PID + Filtros IMU</title>
-<style>
-body {{ font-family:sans-serif; margin:20px; max-width:920px; }}
-.row {{ margin:16px 0; }}
-.label {{ display:flex; justify-content:space-between; margin-bottom:6px; }}
-input[type=range] {{ width:100%; }}
-.box {{ padding:12px; border:1px solid #ddd; border-radius:12px; }}
-.small {{ color:#555; font-size:0.95em; line-height:1.35; }}
-</style></head><body>
-<h2>Self-Balancing (SIN mando): PID + Filtros IMU + Kalman</h2>
-<div class="box">
-<h3>PID</h3>
-<div class="row"><div class="label"><b>Kp</b><span id="kpv"></span></div><input id="kp" type="range" min="{KP_RANGE[0]}" max="{KP_RANGE[1]}" step="0.1"></div>
-<div class="row"><div class="label"><b>Ki</b><span id="kiv"></span></div><input id="ki" type="range" min="{KI_RANGE[0]}" max="{KI_RANGE[1]}" step="0.01"></div>
-<div class="row"><div class="label"><b>Kd</b><span id="kdv"></span></div><input id="kd" type="range" min="{KD_RANGE[0]}" max="{KD_RANGE[1]}" step="0.1"></div>
+<div class="row"><div>MAX RPM</div><input id="max_rpm" type="range" min="0" max="1000" step="1"><div><span id="max_rpm_v"></span></div></div>
+<div class="row"><div>ACC (0..255)</div><input id="acc" type="range" min="0" max="255" step="1"><div><span id="acc_v"></span></div></div>
 
-<h3>Estabilidad</h3>
-<div class="row"><div class="label"><b>BAL_MAX_RPM</b><span id="balv"></span></div><input id="bal" type="range" min="{BAL_MAX_RPM_RANGE[0]}" max="{BAL_MAX_RPM_RANGE[1]}" step="1"></div>
-<div class="row"><div class="label"><b>Slew rpm/s</b><span id="slewv"></span></div><input id="slew" type="range" min="{SLEW_RANGE[0]}" max="{SLEW_RANGE[1]}" step="10"></div>
-<div class="row"><div class="label"><b>I_LIM</b><span id="ilimv"></span></div><input id="ilim" type="range" min="{I_LIM_RANGE[0]}" max="{I_LIM_RANGE[1]}" step="1"></div>
-
-<h3>Filtros IMU</h3>
-<div class="row"><div class="label"><b>ACC_TAU (s)</b><span id="acctauv"></span></div><input id="acctau" type="range" min="{ACC_TAU_RANGE[0]}" max="{ACC_TAU_RANGE[1]}" step="0.005"></div>
-<div class="row"><div class="label"><b>GYRO_TAU (s)</b><span id="gyrotauv"></span></div><input id="gyrotau" type="range" min="{GYRO_TAU_RANGE[0]}" max="{GYRO_TAU_RANGE[1]}" step="0.005"></div>
+<div class="row"><div>SAFE deg</div><input id="safe_angle_deg" type="range" min="5" max="60" step="1"><div><span id="safe_angle_deg_v"></span></div></div>
 
 <h3>Kalman</h3>
-<div class="row"><div class="label"><b>Q_angle</b><span id="qav"></span></div><input id="qa" type="range" min="{K_QA_RANGE[0]}" max="{K_QA_RANGE[1]}" step="0.000001"></div>
-<div class="row"><div class="label"><b>Q_bias</b><span id="qbv"></span></div><input id="qb" type="range" min="{K_QB_RANGE[0]}" max="{K_QB_RANGE[1]}" step="0.000001"></div>
-<div class="row"><div class="label"><b>R_measure</b><span id="rmv"></span></div><input id="rm" type="range" min="{K_RM_RANGE[0]}" max="{K_RM_RANGE[1]}" step="0.0001"></div>
+<div class="row"><div>Q_angle</div><input id="q_angle" type="range" min="0.0001" max="0.02" step="0.0001"><div><span id="q_angle_v"></span></div></div>
+<div class="row"><div>Q_bias</div><input id="q_bias" type="range" min="0.0001" max="0.02" step="0.0001"><div><span id="q_bias_v"></span></div></div>
+<div class="row"><div>R_measure</div><input id="r_measure" type="range" min="0.001" max="0.2" step="0.001"><div><span id="r_measure_v"></span></div></div>
 
-<div class="row"><label><input id="invgyro" type="checkbox"> Invertir signo gyro_rate</label></div>
-<div class="small">Setpoint fijo 0°. Derivada sin filtro.</div>
+<div class="row">
+  <div>Invert gyro</div>
+  <input id="invert_gyro" type="checkbox">
+  <div></div>
 </div>
 
+<h3>Telemetría</h3>
+<p>
+  angle: <code id="t_angle">0</code> deg |
+  gyro: <code id="t_gyro">0</code> dps |
+  pid: <code id="t_pid">0</code> |
+  fallen: <code id="t_fallen">false</code>
+</p>
+
 <script>
-async function getP(){{ const r=await fetch('/params'); return await r.json(); }}
-async function setP(p){{ await fetch('/params',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(p)}}); }}
-function bind(id, vid, fmt){{ const s=document.getElementById(id); const v=document.getElementById(vid);
-const upd=()=>v.textContent=fmt(parseFloat(s.value)); s.addEventListener('input',upd); return {{s,upd}}; }}
+async function apiGet() {
+  const r = await fetch('/api/get'); return await r.json();
+}
+async function apiSet(k, v) {
+  await fetch('/api/set', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({[k]:v})});
+}
+function bindRange(id) {
+  const el = document.getElementById(id);
+  const out = document.getElementById(id+'_v');
+  el.addEventListener('input', async () => {
+    const val = (el.type === 'range') ? parseFloat(el.value) : el.checked;
+    out.textContent = el.type==='range' ? el.value : (el.checked?'1':'0');
+    await apiSet(id, val);
+  });
+}
+async function init() {
+  const st = await apiGet();
+  const keys = ['kp','ki','kd','max_rpm','acc','safe_angle_deg','q_angle','q_bias','r_measure'];
+  for (const k of keys) {
+    const el = document.getElementById(k);
+    el.value = st.params[k];
+    document.getElementById(k+'_v').textContent = el.value;
+    bindRange(k);
+  }
+  const ig = document.getElementById('invert_gyro');
+  ig.checked = !!st.params.invert_gyro;
+  ig.addEventListener('change', async ()=> apiSet('invert_gyro', ig.checked));
+  setInterval(async ()=>{
+    const t = await apiGet();
+    document.getElementById('t_angle').textContent = t.telemetry.angle_deg.toFixed(2);
+    document.getElementById('t_gyro').textContent  = t.telemetry.gyro_dps.toFixed(2);
+    document.getElementById('t_pid').textContent   = t.telemetry.pid_out.toFixed(2);
+    document.getElementById('t_fallen').textContent= String(t.telemetry.fallen);
+  }, 200);
+}
+init();
+</script>
+</body>
+</html>
+"""
 
-(async()=>{{
-  const p=await getP();
-  const kp=bind('kp','kpv',x=>x.toFixed(1));
-  const ki=bind('ki','kiv',x=>x.toFixed(2));
-  const kd=bind('kd','kdv',x=>x.toFixed(2));
-  const bal=bind('bal','balv',x=>x.toFixed(0));
-  const slew=bind('slew','slewv',x=>x.toFixed(0));
-  const ilim=bind('ilim','ilimv',x=>x.toFixed(0));
-  const acctau=bind('acctau','acctauv',x=>x.toFixed(3));
-  const gyrotau=bind('gyrotau','gyrotauv',x=>x.toFixed(3));
-  const qa=bind('qa','qav',x=>x.toExponential(3));
-  const qb=bind('qb','qbv',x=>x.toExponential(3));
-  const rm=bind('rm','rmv',x=>x.toExponential(3));
-  const inv=document.getElementById('invgyro');
+@app.get("/")
+def index():
+    return HTML
 
-  kp.s.value=p.kp; kp.upd(); ki.s.value=p.ki; ki.upd(); kd.s.value=p.kd; kd.upd();
-  bal.s.value=p.bal_max_rpm; bal.upd(); slew.s.value=p.max_rpm_step; slew.upd(); ilim.s.value=p.i_lim; ilim.upd();
-  acctau.s.value=p.acc_tau; acctau.upd(); gyrotau.s.value=p.gyro_tau; gyrotau.upd();
-  qa.s.value=p.k_q_angle; qa.upd(); qb.s.value=p.k_q_bias; qb.upd(); rm.s.value=p.k_r_meas; rm.upd();
-  inv.checked=!!p.invert_gyro;
+@app.get("/api/get")
+def api_get():
+    with _state_lock:
+        return jsonify({"params": asdict(P), "telemetry": telemetry})
 
-  let t=null;
-  const push=()=>{{ clearTimeout(t); t=setTimeout(()=>{{
-    setP({{
-      kp:parseFloat(kp.s.value), ki:parseFloat(ki.s.value), kd:parseFloat(kd.s.value),
-      bal_max_rpm:parseFloat(bal.s.value), max_rpm_step:parseFloat(slew.s.value), i_lim:parseFloat(ilim.s.value),
-      acc_tau:parseFloat(acctau.s.value), gyro_tau:parseFloat(gyrotau.s.value),
-      k_q_angle:parseFloat(qa.s.value), k_q_bias:parseFloat(qb.s.value), k_r_meas:parseFloat(rm.s.value),
-      invert_gyro:inv.checked
-    }});
-  }},120); }};
-  for (const el of [kp.s,ki.s,kd.s,bal.s,slew.s,ilim.s,acctau.s,gyrotau.s,qa.s,qb.s,rm.s]) el.addEventListener('input',push);
-  inv.addEventListener('change',push);
-}})();
-</script></body></html>"""
+@app.post("/api/set")
+def api_set():
+    data = request.get_json(force=True, silent=True) or {}
+    with _state_lock:
+        for k, v in data.items():
+            if not hasattr(P, k):
+                continue
+            # tipos básicos
+            if k in ("max_rpm", "acc"):
+                setattr(P, k, int(v))
+            elif k in ("invert_gyro",):
+                setattr(P, k, bool(v))
+            else:
+                setattr(P, k, float(v))
+    return jsonify({"ok": True})
 
-    @app.get("/")
-    def index():
-        return HTML
+def run_web():
+    # Acceso en: http://<ip_raspberry>:8080
+    app.run(host="0.0.0.0", port=8080, debug=False, use_reloader=False)
 
-    @app.get("/params")
-    def params_get():
-        return jsonify(get_params())
 
-    @app.post("/params")
-    def params_post():
-        d = request.get_json(force=True, silent=True) or {}
+# ============================================================
+# MAIN LOOP
+# ============================================================
 
-        def fclamp(name, lo, hi):
-            if name in d:
-                try:
-                    d[name] = float(d[name])
-                except Exception:
-                    d.pop(name, None)
-                    return
-                d[name] = clamp(d[name], lo, hi)
+stop_flag = False
 
-        fclamp("kp", *KP_RANGE); fclamp("ki", *KI_RANGE); fclamp("kd", *KD_RANGE)
-        fclamp("bal_max_rpm", *BAL_MAX_RPM_RANGE); fclamp("max_rpm_step", *SLEW_RANGE); fclamp("i_lim", *I_LIM_RANGE)
-        fclamp("acc_tau", *ACC_TAU_RANGE); fclamp("gyro_tau", *GYRO_TAU_RANGE)
-        fclamp("k_q_angle", *K_QA_RANGE); fclamp("k_q_bias", *K_QB_RANGE); fclamp("k_r_meas", *K_RM_RANGE)
-        if "invert_gyro" in d:
-            d["invert_gyro"] = bool(d["invert_gyro"])
+def _sig_handler(signum, frame):
+    global stop_flag
+    stop_flag = True
 
-        set_params(d)
-        return jsonify({"ok": True, **get_params()})
+signal.signal(signal.SIGINT, _sig_handler)
+signal.signal(signal.SIGTERM, _sig_handler)
 
-    app.run(host=WEB_HOST, port=WEB_PORT, debug=False, use_reloader=False, threaded=True)
+def clamp(x, lo, hi):
+    return lo if x < lo else hi if x > hi else x
 
-def main() -> int:
-    if SMBus is None:
-        print("ERROR: smbus2/smbus no instalado. pip3 install smbus2", file=sys.stderr)
-        return 1
-    if Flask is None:
-        print("ERROR: Flask no instalado. pip3 install flask", file=sys.stderr)
-        return 1
+def main():
+    global stop_flag
 
-    threading.Thread(target=start_web_server, daemon=True).start()
-    print(f"Web: http://<IP_RPI>:{WEB_PORT}/")
+    # --- Web en hilo ---
+    t = threading.Thread(target=run_web, daemon=True)
+    t.start()
 
+    # --- I2C ---
     bus = SMBus(I2C_BUS)
-    mpu_wake(bus)
+    mpu = MPU6050(bus, MPU_ADDR)
+    mpu.init()
 
-    print("Calibrando IMU (quieto y en posición de equilibrio)...")
-    gyro_y_bias_dps = calibrate_gyro_y_bias(bus)
-    accel_zero_deg = calibrate_accel_angle_zero(bus)
-    print(f"OK. BiasGy={gyro_y_bias_dps:.6f} °/s | AccZero={accel_zero_deg:.6f} °")
+    # Calibración gyro (robot quieto y vertical)
+    # OJO: aquí asumo que el eje X del gyro corresponde al eje de balanceo (pitch).
+    # Si no coincide, cambia el eje usado más abajo (gx/gy/gz).
+    mpu.calibrate_gyro(seconds=2.0, sample_hz=200.0)
 
-    kf = Kalman1D(params.k_q_angle, params.k_q_bias, params.k_r_meas)
-    kf.set_angle(0.0)
+    kal = Kalman1D(P.q_angle, P.q_bias, P.r_measure)
+    pid = PID()
 
-    accel_angle_f = 0.0
-    gyro_rate_f = 0.0
+    # --- RS485 ---
+    ser = serial.Serial(
+        RS485_PORT,
+        RS485_BAUD,
+        timeout=RS485_TIMEOUT_S,
+        bytesize=serial.EIGHTBITS,
+        parity=serial.PARITY_NONE,
+        stopbits=serial.STOPBITS_ONE,
+    )
 
-    ser = open_serial()
-    send_enable_robust(ser, ADDR_LEFT, True)
-    send_enable_robust(ser, ADDR_RIGHT, True)
-    time.sleep(0.05)
-
-    integ = 0.0
-    prev_err = 0.0
-    base_rpm_cmd = 0.0
-
-    imu_err_streak = 0
-
-    period = 1.0 / UPDATE_HZ
-    t_next = time.monotonic()
-    t_prev = t_next
-
-    start_t = time.monotonic()
-    last_alive_print = start_t
+    fallen = False
 
     try:
-        while True:
-            try:
-                now = time.monotonic()
-                dt = now - t_prev
-                t_prev = now
-                if dt < 0.0:
-                    dt = 0.0
-                elif dt > DT_MAX:
-                    dt = DT_MAX
+        # Poner modo bus SR_vFOC y habilitar
+        for a in (MOTOR1_ADDR, MOTOR2_ADDR):
+            mks_set_mode(ser, a, 0x05)  # SR_vFOC
+        for a in (MOTOR1_ADDR, MOTOR2_ADDR):
+            mks_enable(ser, a, True)
 
-                p = get_params()
-                kf.set_params(p["k_q_angle"], p["k_q_bias"], p["k_r_meas"])
+        # Inicializa ángulo con acelerómetro
+        ax, ay, az, gx, gy, gz = mpu.read()
+        # Ángulo accel (pitch) en grados: atan2(ax, az)
+        angle_acc = math.degrees(math.atan2(ax, az))
+        kal.angle = angle_acc
 
-                ax, az, gy_raw = read_accel_gyro(bus)
-                accel_angle = accel_angle_deg_from_ax_az(ax, az) - accel_zero_deg
-                gyro_rate = (gy_raw / GYRO_LSB_PER_DPS) - gyro_y_bias_dps
-                if p["invert_gyro"]:
-                    gyro_rate = -gyro_rate
+        dt_target = 1.0 / max(1.0, P.loop_hz)
+        last = time.monotonic()
 
-                accel_angle_f = lpf_update(accel_angle_f, accel_angle, p["acc_tau"], dt)
-                gyro_rate_f = lpf_update(gyro_rate_f, gyro_rate, p["gyro_tau"], dt)
+        while not stop_flag:
+            now = time.monotonic()
+            dt = now - last
+            if dt <= 0.0:
+                continue
+            last = now
 
-                angle = kf.update(accel_angle_f, gyro_rate_f, dt)
+            # IMU
+            ax, ay, az, gx, gy, gz = mpu.read()
 
-                imu_err_streak = 0  # lectura ok
+            # Selección de ejes:
+            # - angle_acc: pitch estimado con accel (asumiendo X-Z)
+            # - gyro_rate: d(angle)/dt con gyro alrededor del eje de balanceo (asumo gx)
+            angle_acc = math.degrees(math.atan2(ax, az))
+            gyro_rate = gx - mpu.gyro_bias_dps
+            if P.invert_gyro:
+                gyro_rate = -gyro_rate
 
-                if abs(angle) > ANGLE_CUTOFF_DEG:
-                    send_paced(ser, cmd_speed(ADDR_LEFT, 0, 0))
-                    send_paced(ser, cmd_speed(ADDR_RIGHT, 0, 0))
-                    integ = 0.0
-                    prev_err = 0.0
-                    base_rpm_cmd = 0.0
-                    sys.stdout.write(f"\rCAIDO: Ang={angle:+07.2f} deg -> motores 0 rpm                         ")
-                    sys.stdout.flush()
-                else:
-                    err = SETPOINT_DEG - angle
-                    integ += err * dt
-                    integ = clamp(integ, -p["i_lim"], +p["i_lim"])
+            with _state_lock:
+                kal.set_params(P.q_angle, P.q_bias, P.r_measure)
 
-                    derr = (err - prev_err) / dt if dt > 0 else 0.0
-                    prev_err = err
+            angle = kal.update(angle_acc, gyro_rate, dt)
 
-                    base_rpm = (p["kp"] * err) + (p["ki"] * integ) + (p["kd"] * derr)
-                    base_rpm = clamp(base_rpm, -p["bal_max_rpm"], +p["bal_max_rpm"])
+            # Seguridad caída
+            with _state_lock:
+                safe = float(P.safe_angle_deg)
+            if abs(angle) > safe:
+                fallen = True
 
-                    max_step = p["max_rpm_step"] * dt
-                    base_rpm_cmd += clamp(base_rpm - base_rpm_cmd, -max_step, +max_step)
-                    base_rpm_cmd = clamp(base_rpm_cmd, -p["bal_max_rpm"], +p["bal_max_rpm"])
+            # Control
+            out = 0.0
+            if not fallen:
+                # setpoint = 0 deg
+                err = 0.0 - angle
+                with _state_lock:
+                    out = pid.step(err, dt, P.kp, P.ki, P.kd, P.integrator_limit)
 
-                    mc = motors_from_balance(base_rpm_cmd)
-                    send_paced(ser, cmd_speed(ADDR_LEFT, mc.left_rpm, ACC))
-                    send_paced(ser, cmd_speed(ADDR_RIGHT, mc.right_rpm, ACC))
+                # out -> RPM (mapeo directo mínimo). Ajusta Kp/Kd para que tenga escala razonable.
+                with _state_lock:
+                    max_rpm = int(P.max_rpm)
+                    acc = int(P.acc)
+                out = clamp(out, -max_rpm, +max_rpm)
 
-                    sys.stdout.write(
-                        f"\rAng={angle:+07.2f} | AccF={accel_angle_f:+07.2f} | GyF={gyro_rate_f:+07.2f} | "
-                        f"err={err:+07.2f} | base={base_rpm_cmd:+06.1f} | "
-                        f"L={mc.left_rpm:+04d} R={mc.right_rpm:+04d}    "
-                    )
-                    sys.stdout.flush()
+                # Enviar a motores (uno invertido)
+                mks_speed_signed(ser, MOTOR1_ADDR, M1_SIGN * out, acc)
+                mks_speed_signed(ser, MOTOR2_ADDR, M2_SIGN * out, acc)
+            else:
+                # Parar y deshabilitar
+                motors_stop_and_disable(ser)
 
-                # “alive” cada 5 s
-                if now - last_alive_print > 5.0:
-                    last_alive_print = now
-                    print(f"\n[alive] t={now-start_t:.1f}s imu_err_streak={imu_err_streak}")
+            # Telemetría
+            with _state_lock:
+                telemetry["angle_deg"] = float(angle)
+                telemetry["gyro_dps"] = float(gyro_rate)
+                telemetry["pid_out"] = float(out)
+                telemetry["fallen"] = bool(fallen)
+                telemetry["fallen"] = bool(fallen)
 
-                t_next += period
-                sleep_s = t_next - time.monotonic()
-                if sleep_s > 0:
-                    time.sleep(sleep_s)
-                else:
-                    t_next = time.monotonic()
-
-            except Exception as e:
-                imu_err_streak += 1
-                print(f"\n[ERROR loop] {type(e).__name__}: {e}", file=sys.stderr)
-                traceback.print_exc()
-
-                if IMU_ERROR_MOTOR_ZERO:
-                    try:
-                        send_paced(ser, cmd_speed(ADDR_LEFT, 0, 0))
-                        send_paced(ser, cmd_speed(ADDR_RIGHT, 0, 0))
-                    except Exception:
-                        pass
-
-                if imu_err_streak >= IMU_MAX_CONSECUTIVE_ERRORS:
-                    print("\n[ERROR] demasiados fallos IMU seguidos -> saliendo (seguro)", file=sys.stderr)
-                    break
-
-                time.sleep(IMU_ERROR_SLEEP_S)
-
-    except KeyboardInterrupt:
-        print("\nCTRL+C -> Parando motores...")
+            # Mantener frecuencia (sin deriva)
+            elapsed = time.monotonic() - now
+            sleep_s = dt_target - elapsed
+            if sleep_s > 0:
+                time.sleep(sleep_s)
 
     finally:
         try:
-            send_paced(ser, cmd_speed(ADDR_LEFT, 0, 0))
-            send_paced(ser, cmd_speed(ADDR_RIGHT, 0, 0))
-            time.sleep(0.05)
-            send_enable_robust(ser, ADDR_LEFT, False)
-            send_enable_robust(ser, ADDR_RIGHT, False)
-        except Exception as e:
-            print(f"WARNING: stop/disable falló: {e}", file=sys.stderr)
-
-        try:
-            ser.close()
-        except Exception:
-            pass
-        try:
-            bus.close()
-        except Exception:
-            pass
-
-    return 0
+            motors_stop_and_disable(ser)
+        finally:
+            try:
+                ser.close()
+            except Exception:
+                pass
+            try:
+                bus.close()
+            except Exception:
+                pass
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
