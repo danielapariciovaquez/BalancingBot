@@ -2,15 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-MPU6050 (GY-521) por I2C + Kalman 1D (pitch) + Web UI (Canvas) con dibujo mejorado
-- Backend: Flask + Flask-SocketIO (eventlet)
-- Frontend: Socket.IO servido desde el propio servidor (/socket.io/socket.io.js) => compatibilidad asegurada
-- Dibujo: robot de autobalanceo 2 ruedas (péndulo invertido) rotando alrededor del eje de ruedas
+MPU6050 (GY-521) I2C + Kalman 1D (pitch) + Web UI (Canvas)
+- NO usa eventlet (evita deprecación y monkey_patch)
+- Flask-SocketIO en async_mode="threading"
+- El JS de Socket.IO se sirve desde /socket.io/socket.io.js (misma versión => sin incompatibilidades)
 """
-
-# ---------- IMPORTANTE: monkey_patch ANTES de Flask/SocketIO ----------
-import eventlet
-eventlet.monkey_patch()
 
 import math
 import time
@@ -50,15 +46,6 @@ GYRO_CALIB_SAMPLES = 1000    # robot quieto y vertical durante el arranque
 # Kalman 1D (ángulo + bias gyro)
 # ============================================================
 class Kalman1D:
-    """
-    Estado:
-      angle (deg)
-      bias  (deg/s)
-    Entrada:
-      new_rate (deg/s)
-      dt (s)
-      new_angle (deg) (medida por acelerómetro)
-    """
     def __init__(self, Q_angle=0.001, Q_bias=0.003, R_measure=0.03):
         self.Q_angle = float(Q_angle)
         self.Q_bias = float(Q_bias)
@@ -67,7 +54,6 @@ class Kalman1D:
         self.angle = 0.0
         self.bias = 0.0
 
-        # Matriz de covarianza P (2x2)
         self.P00 = 0.0
         self.P01 = 0.0
         self.P10 = 0.0
@@ -135,25 +121,19 @@ class MPU6050:
         return self.bus.read_i2c_block_data(self.addr, reg, n)
 
     def _init_device(self):
-        # Wake up
         self._write(REG_PWR_MGMT_1, 0x00)
         time.sleep(0.05)
 
-        # DLPF + sample rate
-        # CONFIG: DLPF_CFG=3 => ~44Hz accel / 42Hz gyro (aprox)
+        # DLPF activo
         self._write(REG_CONFIG, 0x03)
 
-        # SMPLRT_DIV: si base 1kHz (DLPF activo), 1kHz/(1+4)=200Hz
+        # 1kHz/(1+4)=200Hz aprox.
         self._write(REG_SMPLRT_DIV, 4)
 
-        # Gyro ±250 dps
-        self._write(REG_GYRO_CONFIG, 0x00)
-
-        # Accel ±2g
-        self._write(REG_ACCEL_CONFIG, 0x00)
+        self._write(REG_GYRO_CONFIG, 0x00)   # ±250 dps
+        self._write(REG_ACCEL_CONFIG, 0x00)  # ±2g
 
     def read_accel_gyro(self):
-        # 14 bytes: accel(6) + temp(2) + gyro(6)
         b = self._read_block(REG_ACCEL_XOUT_H, 14)
         ax = _to_int16(b[0], b[1])
         ay = _to_int16(b[2], b[3])
@@ -170,7 +150,7 @@ class MPU6050:
             pass
 
 # ============================================================
-# Web UI (HTML embebido)
+# Web UI
 # ============================================================
 HTML = r"""
 <!doctype html>
@@ -236,15 +216,14 @@ HTML = r"""
     </div>
   </div>
 
-  <!-- IMPORTANTE: JS de Socket.IO servido por Flask-SocketIO => versión compatible -->
+  <!-- JS de Socket.IO servido por Flask-SocketIO => no hay mismatch de protocolos -->
   <script src="/socket.io/socket.io.js"></script>
   <script>
-    const socket = io({ transports: ["websocket", "polling"] });
+    const socket = io({ transports: ["websocket","polling"] });
 
     const cv = document.getElementById("cv");
     const ctx = cv.getContext("2d");
 
-    // Polyfill roundRect (por compat)
     if (!CanvasRenderingContext2D.prototype.roundRect) {
       CanvasRenderingContext2D.prototype.roundRect = function(x,y,w,h,r){
         r = Math.min(r, w/2, h/2);
@@ -260,15 +239,10 @@ HTML = r"""
     }
 
     function drawGrid(){
-      // rejilla tenue
       ctx.save();
       ctx.globalAlpha = 0.12;
-      for(let x=0;x<=cv.width;x+=40){
-        ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,cv.height); ctx.stroke();
-      }
-      for(let y=0;y<=cv.height;y+=40){
-        ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(cv.width,y); ctx.stroke();
-      }
+      for(let x=0;x<=cv.width;x+=40){ ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,cv.height); ctx.stroke(); }
+      for(let y=0;y<=cv.height;y+=40){ ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(cv.width,y); ctx.stroke(); }
       ctx.restore();
     }
 
@@ -276,39 +250,28 @@ HTML = r"""
       ctx.clearRect(0,0,cv.width,cv.height);
       drawGrid();
 
-      // referencia suelo
       const groundY = 380;
       ctx.beginPath(); ctx.moveTo(40, groundY); ctx.lineTo(cv.width-40, groundY); ctx.stroke();
 
-      // "pivote" físico del robot (eje ruedas) en canvas
-      const axleX = cv.width*0.5;
+      const axleX = cv.width * 0.5;
       const axleY = groundY - 22;
 
-      // geometría del robot (en su frame local)
       const wheelR = 28;
-      const wheelBase = 170;        // distancia entre centros de ruedas
+      const wheelBase = 170;
       const wheelX_L = -wheelBase/2;
       const wheelX_R = +wheelBase/2;
-      const wheelY   = 0;
 
-      const chassisW = 220;
-      const chassisH = 90;
-      const chassisX = -chassisW/2;
-      const chassisY = -chassisH - 16;
+      const chassisW = 220, chassisH = 90;
+      const chassisX = -chassisW/2, chassisY = -chassisH - 16;
 
-      const mastW = 26;
-      const mastH = 160;
-      const mastX = -mastW/2;
-      const mastY = chassisY - mastH + 10;
+      const mastW = 26, mastH = 160;
+      const mastX = -mastW/2, mastY = chassisY - mastH + 10;
 
-      const headR = 22;
-      const headX = 0;
-      const headY = mastY - 18;
+      const headR = 22, headY = mastY - 18;
 
-      // Convención: angleDeg>0 => inclina hacia delante (elige visualmente)
       const a = angleDeg * Math.PI/180.0;
 
-      // guía vertical (setpoint)
+      // vertical setpoint
       ctx.save();
       ctx.globalAlpha = 0.35;
       ctx.setLineDash([6,6]);
@@ -319,7 +282,7 @@ HTML = r"""
       ctx.setLineDash([]);
       ctx.restore();
 
-      // Sombra en suelo (no rota)
+      // sombra
       ctx.save();
       ctx.globalAlpha = 0.18;
       ctx.beginPath();
@@ -327,25 +290,15 @@ HTML = r"""
       ctx.fill();
       ctx.restore();
 
-      // ROTACIÓN alrededor del eje de ruedas
+      // rotación sobre eje de ruedas
       ctx.save();
       ctx.translate(axleX, axleY);
-      ctx.rotate(-a);     // signo visual (si lo quieres al revés, cambia aquí)
+      ctx.rotate(-a);
       ctx.translate(-axleX, -axleY);
 
-      // --- ruedas ---
       function wheel(cx, cy){
-        // neumático
-        ctx.beginPath();
-        ctx.arc(cx, cy, wheelR, 0, 2*Math.PI);
-        ctx.stroke();
-
-        // llanta interior
-        ctx.beginPath();
-        ctx.arc(cx, cy, wheelR*0.62, 0, 2*Math.PI);
-        ctx.stroke();
-
-        // radios
+        ctx.beginPath(); ctx.arc(cx, cy, wheelR, 0, 2*Math.PI); ctx.stroke();
+        ctx.beginPath(); ctx.arc(cx, cy, wheelR*0.62, 0, 2*Math.PI); ctx.stroke();
         for(let k=0;k<6;k++){
           const th = k*(Math.PI/3);
           ctx.beginPath();
@@ -355,36 +308,30 @@ HTML = r"""
         }
       }
 
-      // rueda izq
-      wheel(axleX + wheelX_L, axleY + wheelY);
-      // rueda der
-      wheel(axleX + wheelX_R, axleY + wheelY);
+      wheel(axleX + wheelX_L, axleY);
+      wheel(axleX + wheelX_R, axleY);
 
-      // eje (axle)
       ctx.beginPath();
       ctx.moveTo(axleX + wheelX_L + wheelR*0.2, axleY);
       ctx.lineTo(axleX + wheelX_R - wheelR*0.2, axleY);
       ctx.stroke();
 
-      // --- chasis (caja) ---
       ctx.beginPath();
       ctx.roundRect(axleX + chassisX, axleY + chassisY, chassisW, chassisH, 14);
       ctx.stroke();
 
-      // “batería”/masa interior (bloque)
       ctx.beginPath();
       ctx.roundRect(axleX - 60, axleY + chassisY + 18, 120, 44, 10);
       ctx.stroke();
 
-      // “drivers” laterales (2 bloques)
       ctx.beginPath();
       ctx.roundRect(axleX + chassisX + 14, axleY + chassisY + 18, 44, 44, 8);
       ctx.stroke();
+
       ctx.beginPath();
       ctx.roundRect(axleX + chassisX + chassisW - 58, axleY + chassisY + 18, 44, 44, 8);
       ctx.stroke();
 
-      // --- mástil ---
       ctx.beginPath();
       ctx.roundRect(axleX + mastX, axleY + mastY, mastW, mastH, 10);
       ctx.stroke();
@@ -394,36 +341,16 @@ HTML = r"""
       ctx.moveTo(axleX - 55, axleY + mastY + 18);
       ctx.lineTo(axleX + 55, axleY + mastY + 18);
       ctx.stroke();
+      ctx.beginPath(); ctx.roundRect(axleX - 62, axleY + mastY + 10, 18, 16, 6); ctx.stroke();
+      ctx.beginPath(); ctx.roundRect(axleX + 44, axleY + mastY + 10, 18, 16, 6); ctx.stroke();
+
+      // cabeza
       ctx.beginPath();
-      ctx.roundRect(axleX - 62, axleY + mastY + 10, 18, 16, 6);
-      ctx.stroke();
-      ctx.beginPath();
-      ctx.roundRect(axleX + 44, axleY + mastY + 10, 18, 16, 6);
+      ctx.arc(axleX, axleY + headY, headR, 0, 2*Math.PI);
       ctx.stroke();
 
-      // cabeza/masa superior
-      ctx.beginPath();
-      ctx.arc(axleX + headX, axleY + headY, headR, 0, 2*Math.PI);
-      ctx.stroke();
-
-      // vector gravedad en el frame rotado del robot (para visualizar error)
-      ctx.save();
-      ctx.globalAlpha = 0.65;
-      ctx.beginPath();
-      ctx.moveTo(axleX, axleY - 220);
-      ctx.lineTo(axleX, axleY - 300);
-      ctx.stroke();
-      // flecha
-      ctx.beginPath();
-      ctx.moveTo(axleX - 6, axleY - 294);
-      ctx.lineTo(axleX, axleY - 300);
-      ctx.lineTo(axleX + 6, axleY - 294);
-      ctx.stroke();
       ctx.restore();
 
-      ctx.restore(); // fin rotación
-
-      // texto
       ctx.fillText("angle = " + angleDeg.toFixed(2) + " deg", 40, 28);
       ctx.fillText("setpoint = 0.00 deg", 40, 48);
     }
@@ -458,12 +385,8 @@ HTML = r"""
       });
     });
 
-    socket.on("connect", () => {
-      document.getElementById("st").textContent = "conectado";
-    });
-    socket.on("disconnect", () => {
-      document.getElementById("st").textContent = "desconectado";
-    });
+    socket.on("connect", () => document.getElementById("st").textContent = "conectado");
+    socket.on("disconnect", () => document.getElementById("st").textContent = "desconectado");
 
     socket.on("imu", (msg) => {
       document.getElementById("ang").textContent = msg.angle_deg.toFixed(2);
@@ -479,18 +402,13 @@ HTML = r"""
 """
 
 # ============================================================
-# Flask + SocketIO
+# Flask + SocketIO (threading)
 # ============================================================
 app = Flask(__name__)
-socketio = SocketIO(app, async_mode="eventlet", cors_allowed_origins="*")
+socketio = SocketIO(app, async_mode="threading", cors_allowed_origins="*")
 
 kalman = Kalman1D()
 invert_gyro = False
-
-state_lock = threading.Lock()
-latest_angle = 0.0
-latest_rate = 0.0
-latest_dt = 0.0
 
 stop_event = threading.Event()
 
@@ -509,18 +427,12 @@ def on_kalman_params(msg):
         kalman.set_params(Q_angle=q_angle, Q_bias=q_bias, R_measure=r_meas)
         invert_gyro = inv
     except Exception:
-        # No reventar por payload malformado
         pass
 
-# ============================================================
-# Hilo IMU
-# ============================================================
 def imu_thread():
-    global latest_angle, latest_rate, latest_dt
-
     mpu = MPU6050(I2C_BUS, MPU_ADDR)
 
-    # ---------- Calibración gyro (robot quieto) ----------
+    # calibración gyro X (quieto)
     gx_sum = 0.0
     for _ in range(GYRO_CALIB_SAMPLES):
         _, _, _, gx, _, _ = mpu.read_accel_gyro()
@@ -528,19 +440,16 @@ def imu_thread():
         time.sleep(0.001)
     gyro_x_bias = gx_sum / float(GYRO_CALIB_SAMPLES)
 
-    # ---------- Inicializa ángulo con acelerómetro ----------
+    # init con acelerómetro
     ax, ay, az, gx, gy, gz = mpu.read_accel_gyro()
-    ax_g = ax / ACC_LSB_PER_G
     ay_g = ay / ACC_LSB_PER_G
     az_g = az / ACC_LSB_PER_G
 
     # ========= MAPEO EJES (pitch) =========
-    # Por defecto: pitch = atan2(ay, az) ; rate = gyroX
     acc_angle_deg = math.degrees(math.atan2(ay_g, az_g))
     kalman.angle = acc_angle_deg
 
     last_t = time.perf_counter()
-
     emit_period = 1.0 / EMIT_HZ
     next_emit = last_t
 
@@ -553,7 +462,6 @@ def imu_thread():
 
         ax, ay, az, gx, gy, gz = mpu.read_accel_gyro()
 
-        ax_g = ax / ACC_LSB_PER_G
         ay_g = ay / ACC_LSB_PER_G
         az_g = az / ACC_LSB_PER_G
 
@@ -566,16 +474,11 @@ def imu_thread():
 
         angle_deg = kalman.update(acc_angle_deg, gyro_x_dps, dt)
 
-        with state_lock:
-            latest_angle = float(angle_deg)
-            latest_rate = float(gyro_x_dps)
-            latest_dt = float(dt)
-
         if t0 >= next_emit:
             socketio.emit("imu", {
-                "angle_deg": latest_angle,
-                "gyro_dps": latest_rate,
-                "dt_s": latest_dt,
+                "angle_deg": float(angle_deg),
+                "gyro_dps": float(gyro_x_dps),
+                "dt_s": float(dt),
             })
             next_emit = t0 + emit_period
 
@@ -587,9 +490,6 @@ def imu_thread():
 
     mpu.close()
 
-# ============================================================
-# Main / señales
-# ============================================================
 def shutdown_handler(signum, frame):
     stop_event.set()
 
@@ -600,7 +500,7 @@ def main():
     th = threading.Thread(target=imu_thread, daemon=True)
     th.start()
 
-    # Servidor web (sin reloader para evitar doble ejecución)
+    # Sin reloader, determinista
     socketio.run(app, host="0.0.0.0", port=5000, debug=False, use_reloader=False)
 
     stop_event.set()
