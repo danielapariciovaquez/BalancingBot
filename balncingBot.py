@@ -47,7 +47,7 @@ GYRO_LSB_PER_DPS = 131.0
 CAL_SAMPLES_GYRO = 800
 CAL_SAMPLES_ACCEL = 200
 
-ANGLE_CUTOFF_DEG = 35.0
+ANGLE_CUTOFF_DEG = 50    
 DT_MAX = 0.05
 # ====================================================================
 
@@ -272,8 +272,8 @@ def calibrate_accel_angle_zero(bus: SMBus) -> float:
     return s / float(CAL_SAMPLES_ACCEL)
 
 def motors_from_balance(base_rpm: float, turn_rpm: float) -> MotorCmd:
-    left = base_rpm - turn_rpm
-    right = base_rpm + turn_rpm
+    left = base_rpm - turn_rpm/10
+    right = base_rpm + turn_rpm/10
 
     left_rpm = int(round(clamp(left, -MAX_RPM, MAX_RPM)))
     right_rpm = int(round(clamp(right, -MAX_RPM, MAX_RPM)))
