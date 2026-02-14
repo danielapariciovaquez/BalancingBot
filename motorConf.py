@@ -2,6 +2,8 @@
 import time
 import threading
 import serial
+from typing import Optional, Dict, Any
+
 from flask import Flask, request, jsonify
 
 # ===================== CONFIG =====================
@@ -23,9 +25,8 @@ WEB_PORT = 8000
 
 app = Flask(__name__)
 
-# Serial lock (evita colisiones TX/RX si llegan requests simultáneas)
 ser_lock = threading.Lock()
-ser: serial.Serial | None = None
+ser: Optional[serial.Serial] = None
 
 
 # ===================== RS485 / FRAMES =====================
@@ -87,12 +88,12 @@ def tx(s: serial.Serial, data: bytes) -> None:
     if INTER_FRAME_DELAY_S > 0:
         time.sleep(INTER_FRAME_DELAY_S)
 
-def txrx_ack(s: serial.Serial, data: bytes, expect_code: int, expect_addr: int) -> dict:
+def txrx_ack(s: serial.Serial, data: bytes, expect_code: int, expect_addr: int) -> Dict[str, Any]:
     """
     Envía frame y espera ACK 5 bytes: FB addr code status crc.
-    Devuelve dict con info y validaciones.
+    Si no llega ACK, devuelve ok=False con raw.
     """
-    # Limpia input para no mezclar ACK antiguos
+    # Limpia input para evitar “ACK viejo”
     s.reset_input_buffer()
     tx(s, data)
 
@@ -120,16 +121,13 @@ def txrx_ack(s: serial.Serial, data: bytes, expect_code: int, expect_addr: int) 
     }
 
 def cmd_enable(addr: int, en: bool) -> bytes:
-    # FA addr F3 enable CRC
     return frame(addr, 0xF3, bytes([0x01 if en else 0x00]))
 
 def cmd_pid(addr: int, mode: str, kp: int, ki: int, kd: int, kv: int) -> bytes:
     """
-    Manual 5.3:
-      vFOC PID: code 0x96
-      CLOSE PID: code 0x97
-      payload: Kp(2) Ki(2) Kd(2) Kv(2), big-endian
-      ranges: 0..1024
+    vFOC PID:  0x96
+    CLOSE PID: 0x97
+    payload: Kp(2) Ki(2) Kd(2) Kv(2) big-endian, 0..1024
     """
     if mode == "vFOC":
         code = 0x96
@@ -138,7 +136,6 @@ def cmd_pid(addr: int, mode: str, kp: int, ki: int, kd: int, kv: int) -> bytes:
     else:
         raise ValueError("mode must be 'vFOC' or 'CLOSE'")
 
-    # clamp a rango del manual 0..1024
     kp = max(0, min(1024, int(kp)))
     ki = max(0, min(1024, int(ki)))
     kd = max(0, min(1024, int(kd)))
@@ -146,6 +143,7 @@ def cmd_pid(addr: int, mode: str, kp: int, ki: int, kd: int, kv: int) -> bytes:
 
     payload = u16be(kp) + u16be(ki) + u16be(kd) + u16be(kv)
     return frame(addr, code, payload)
+
 
 # ===================== WEB UI =====================
 HTML = r"""
@@ -186,6 +184,10 @@ HTML = r"""
     </div>
 
     <div class="row">
+      <label><input id="waitack" type="checkbox" checked> Esperar ACK (si tu driver responde)</label>
+    </div>
+
+    <div class="row">
       <div class="label"><b>Kp</b><span id="kpv"></span></div>
       <input id="kp" type="range" min="0" max="1024" step="1">
     </div>
@@ -204,12 +206,12 @@ HTML = r"""
 
     <div class="btns">
       <button onclick="applyPID()">Apply PID (ambos)</button>
-      <button onclick="loadDefaults()">Defaults típicos (manual)</button>
+      <button onclick="loadDefaults()">Defaults típicos</button>
+      <button onclick="health()">Health</button>
     </div>
 
     <div class="small">
-      Envía <code>FA addr 96/97 Kp Ki Kd Kv CRC</code> y espera ACK
-      <code>FB addr 96/97 status CRC</code>.
+      Si no recibes ACK, desmarca <code>Esperar ACK</code> para probar que al menos está transmitiendo sin bloquear.
     </div>
 
     <h3>Resultado</h3>
@@ -245,8 +247,10 @@ async function doEnable(en) {
 
 async function applyPID() {
   const mode = document.getElementById('mode').value;
+  const wait_ack = document.getElementById('waitack').checked;
   const payload = {
     mode,
+    wait_ack,
     kp: parseInt(kp.value,10),
     ki: parseInt(ki.value,10),
     kd: parseInt(kd.value,10),
@@ -261,9 +265,6 @@ async function applyPID() {
 }
 
 function loadDefaults() {
-  // Defaults del manual:
-  // vFOC:  Kp=0x00DC(220) Ki=0x0064(100) Kd=0x010E(270) Kv=0x0140(320)
-  // CLOSE: Kp=0x00C8(200) Ki=0x0050(80)  Kd=0x00FA(250) Kv=0x012C(300)
   const mode = document.getElementById('mode').value;
   if (mode === "vFOC") { kp.value=220; ki.value=100; kd.value=270; kv.value=320; }
   else { kp.value=200; ki.value=80; kd.value=250; kv.value=300; }
@@ -272,6 +273,11 @@ function loadDefaults() {
   kd.dispatchEvent(new Event('input'));
   kv.dispatchEvent(new Event('input'));
   out("Defaults cargados en sliders (no enviados aún).");
+}
+
+async function health(){
+  const r = await fetch('/health');
+  out(await r.json());
 }
 </script>
 </body>
@@ -282,27 +288,45 @@ function loadDefaults() {
 def index():
     return HTML
 
+@app.get("/health")
+def api_health():
+    try:
+        with ser_lock:
+            s = ensure_serial()
+            return jsonify({
+                "ok": True,
+                "serial_is_open": bool(s.is_open),
+                "port": s.port,
+                "baudrate": s.baudrate,
+                "timeout": s.timeout,
+            })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 @app.post("/enable")
 def api_enable():
     data = request.get_json(force=True, silent=True) or {}
     en = bool(data.get("enable", False))
 
-    with ser_lock:
-        s = ensure_serial()
-        # enable/disable no siempre responde; lo hacemos robusto (reintento + pacing)
-        for _ in range(ENABLE_RETRIES):
-            tx(s, cmd_enable(ADDR1, en))
-            time.sleep(ENABLE_RETRY_DELAY_S)
-        for _ in range(ENABLE_RETRIES):
-            tx(s, cmd_enable(ADDR2, en))
-            time.sleep(ENABLE_RETRY_DELAY_S)
-
-    return jsonify({"ok": True, "enable": en})
+    try:
+        with ser_lock:
+            s = ensure_serial()
+            # robusto: reintentos + pacing
+            for _ in range(ENABLE_RETRIES):
+                tx(s, cmd_enable(ADDR1, en))
+                time.sleep(ENABLE_RETRY_DELAY_S)
+            for _ in range(ENABLE_RETRIES):
+                tx(s, cmd_enable(ADDR2, en))
+                time.sleep(ENABLE_RETRY_DELAY_S)
+        return jsonify({"ok": True, "enable": en})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.post("/pid")
 def api_pid():
     data = request.get_json(force=True, silent=True) or {}
     mode = str(data.get("mode", "vFOC"))
+    wait_ack = bool(data.get("wait_ack", True))
 
     try:
         kp = int(data.get("kp", 0))
@@ -315,13 +339,12 @@ def api_pid():
     if mode not in ("vFOC", "CLOSE"):
         return jsonify({"ok": False, "error": "mode debe ser 'vFOC' o 'CLOSE'"}), 400
 
-    # Frame code según modo
     code = 0x96 if mode == "vFOC" else 0x97
 
-    # Enviar a ambos + leer ACK
-    res = {
+    res: Dict[str, Any] = {
         "ok": True,
         "mode": mode,
+        "wait_ack": wait_ack,
         "set": {
             "kp": max(0, min(1024, kp)),
             "ki": max(0, min(1024, ki)),
@@ -332,22 +355,33 @@ def api_pid():
         "motor_0x02": None,
     }
 
-    with ser_lock:
-        s = ensure_serial()
+    try:
+        with ser_lock:
+            s = ensure_serial()
 
-        pkt1 = cmd_pid(ADDR1, mode, kp, ki, kd, kv)
-        pkt2 = cmd_pid(ADDR2, mode, kp, ki, kd, kv)
+            pkt1 = cmd_pid(ADDR1, mode, kp, ki, kd, kv)
+            pkt2 = cmd_pid(ADDR2, mode, kp, ki, kd, kv)
 
-        r1 = txrx_ack(s, pkt1, expect_code=code, expect_addr=ADDR1)
-        # pequeña separación extra para no pisar el ACK del segundo
-        time.sleep(0.006)
-        r2 = txrx_ack(s, pkt2, expect_code=code, expect_addr=ADDR2)
+            if wait_ack:
+                r1 = txrx_ack(s, pkt1, expect_code=code, expect_addr=ADDR1)
+                time.sleep(0.006)
+                r2 = txrx_ack(s, pkt2, expect_code=code, expect_addr=ADDR2)
+            else:
+                tx(s, pkt1)
+                time.sleep(0.006)
+                tx(s, pkt2)
+                r1 = {"ok": True, "note": "sent_no_ack"}
+                r2 = {"ok": True, "note": "sent_no_ack"}
 
-    res["motor_0x01"] = r1
-    res["motor_0x02"] = r2
-    res["ok"] = bool(r1.get("ok", False) and r2.get("ok", False))
+        res["motor_0x01"] = r1
+        res["motor_0x02"] = r2
+        if wait_ack:
+            res["ok"] = bool(r1.get("ok", False) and r2.get("ok", False))
 
-    return jsonify(res)
+        return jsonify(res)
+
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 def main():
     # abre puerto al arranque para fallar rápido si no existe
