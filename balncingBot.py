@@ -4,6 +4,7 @@ import sys
 import math
 import serial
 import threading
+import traceback
 from dataclasses import dataclass
 
 # ===================== RS485 / MOTORES =====================
@@ -14,8 +15,8 @@ TIMEOUT_S = 0.05
 ADDR_LEFT  = 0x01
 ADDR_RIGHT = 0x02
 
-MAX_RPM = 300          # límite del comando F6
-ACC = 255              # aceleración F6
+MAX_RPM = 300
+ACC = 255
 
 INTER_FRAME_DELAY_S = 0.004
 ENABLE_RETRIES = 2
@@ -29,16 +30,10 @@ INVERT_RIGHT = True
 UPDATE_HZ = 150
 DT_MAX = 0.05
 ANGLE_CUTOFF_DEG = 35.0
-
 SETPOINT_DEG = 0.0
 
-# Slew-rate para suavizar (rpm/s)
 MAX_RPM_STEP_PER_S = 700.0
-
-# límite de salida del balanceo (rpm)
 BAL_MAX_RPM_DEFAULT = 120.0
-
-# anti-windup integral (en “rpm-equivalente”)
 I_LIM_DEFAULT = 200.0
 # ===================================================
 
@@ -55,17 +50,12 @@ GYRO_LSB_PER_DPS = 131.0
 
 CAL_SAMPLES_GYRO  = 800
 CAL_SAMPLES_ACCEL = 200
-
-# Convención: al inclinar hacia adelante, el ángulo decrementa
-# (se aplica en accel_angle_deg_from_ax_az)
-# Gyro: si no cuadra el signo, activa invert_gyro en la web.
 # ===========================================================
 
 # ===================== WEB =====================
 WEB_HOST = "0.0.0.0"
 WEB_PORT = 8000
 
-# Rango sliders
 KP_RANGE = (0.0, 80.0)
 KI_RANGE = (0.0, 20.0)
 KD_RANGE = (0.0, 50.0)
@@ -82,6 +72,12 @@ K_QB_RANGE = (1e-6, 5e-1)
 K_RM_RANGE = (1e-4, 2e-1)
 # ===========================================================
 
+# ---- Tolerancia a fallos IMU ----
+IMU_MAX_CONSECUTIVE_ERRORS = 20   # 20 iteraciones seguidas con error
+IMU_ERROR_MOTOR_ZERO = True       # en error IMU: manda 0 rpm (seguro)
+IMU_ERROR_SLEEP_S = 0.002         # pequeña pausa para no quemar I2C
+# --------------------------------
+
 try:
     from smbus2 import SMBus
 except ImportError:
@@ -96,7 +92,6 @@ except ImportError:
     Flask = None
 
 
-# ===================== UTIL =====================
 def clamp(x: float, lo: float, hi: float) -> float:
     return lo if x < lo else hi if x > hi else x
 
@@ -161,20 +156,14 @@ def send_enable_robust(ser: serial.Serial, addr: int, en: bool) -> None:
             time.sleep(ENABLE_RETRY_DELAY_S)
 
 def motors_from_balance(base_rpm: float) -> MotorCmd:
-    left = base_rpm
-    right = base_rpm
-    left_rpm = int(round(clamp(left, -MAX_RPM, MAX_RPM)))
-    right_rpm = int(round(clamp(right, -MAX_RPM, MAX_RPM)))
-
+    left_rpm = int(round(clamp(base_rpm, -MAX_RPM, MAX_RPM)))
+    right_rpm = int(round(clamp(base_rpm, -MAX_RPM, MAX_RPM)))
     if INVERT_LEFT:
         left_rpm = -left_rpm
     if INVERT_RIGHT:
         right_rpm = -right_rpm
-
     return MotorCmd(left_rpm=left_rpm, right_rpm=right_rpm)
 
-
-# ===================== I2C / MPU =====================
 def i2c_require():
     if SMBus is None:
         raise RuntimeError("No se encontró smbus2/smbus. Instala: pip3 install smbus2")
@@ -205,7 +194,7 @@ def accel_angle_deg_from_ax_az(ax_raw: int, az_raw: int) -> float:
     ax_g = ax_raw / ACC_LSB_PER_G
     az_g = az_raw / ACC_LSB_PER_G
     ang = math.degrees(math.atan2(ax_g, az_g))
-    return -ang  # forward tilt => angle decrece
+    return -ang
 
 def calibrate_gyro_y_bias(bus: SMBus) -> float:
     s = 0.0
@@ -223,30 +212,19 @@ def calibrate_accel_angle_zero(bus: SMBus) -> float:
         time.sleep(0.001)
     return s / float(CAL_SAMPLES_ACCEL)
 
-
-# ===================== LPF 1er orden =====================
 def lpf_update(x_f: float, x: float, tau: float, dt: float) -> float:
     if tau <= 0.0 or dt <= 0.0:
         return x
     a = dt / (tau + dt)
     return x_f + a * (x - x_f)
 
-
-# ===================== KALMAN 1D (CORREGIDO) =====================
 class Kalman1D:
-    """
-    Estado: angle, bias
-    Entrada: gyro_rate (deg/s)
-    Medida: accel_angle (deg)
-    """
     def __init__(self, q_angle=0.001, q_bias=0.003, r_measure=0.03):
         self.q_angle = float(q_angle)
         self.q_bias = float(q_bias)
         self.r_measure = float(r_measure)
-
         self.angle = 0.0
         self.bias = 0.0
-
         self.P00 = 1.0
         self.P01 = 0.0
         self.P10 = 0.0
@@ -261,18 +239,15 @@ class Kalman1D:
         self.r_measure = float(r_measure)
 
     def update(self, meas_angle_deg: float, gyro_rate_dps: float, dt: float) -> float:
-        # Predict
         rate = gyro_rate_dps - self.bias
         self.angle += dt * rate
 
-        # Covariance predict (forma estándar)
         P00 = self.P00 + dt * (dt*self.P11 - self.P01 - self.P10 + self.q_angle)
         P01 = self.P01 - dt * self.P11
         P10 = self.P10 - dt * self.P11
         P11 = self.P11 + self.q_bias * dt
         self.P00, self.P01, self.P10, self.P11 = P00, P01, P10, P11
 
-        # Update
         y = meas_angle_deg - self.angle
         S = self.P00 + self.r_measure
         K0 = self.P00 / S
@@ -281,9 +256,7 @@ class Kalman1D:
         angle_new = self.angle + K0 * y
         bias_new  = self.bias  + K1 * y
 
-        # Guardar P antiguos para la actualización (evita el bug de pisar términos)
         P00_old, P01_old, P10_old, P11_old = self.P00, self.P01, self.P10, self.P11
-
         self.P00 = P00_old - K0 * P00_old
         self.P01 = P01_old - K0 * P01_old
         self.P10 = P10_old - K1 * P00_old
@@ -293,11 +266,8 @@ class Kalman1D:
         self.bias = bias_new
         return self.angle
 
-
-# ===================== PARAMS compartidos (WEB <-> LOOP) =====================
 class Params:
     def __init__(self):
-        # PID (valores iniciales razonables; tú los ajustas)
         self.kp = 18.0
         self.ki = 0.0
         self.kd = 0.9
@@ -306,11 +276,9 @@ class Params:
         self.bal_max_rpm = BAL_MAX_RPM_DEFAULT
         self.max_rpm_step = MAX_RPM_STEP_PER_S
 
-        # Filtros IMU pre-Kalman
         self.acc_tau = 0.03
         self.gyro_tau = 0.02
 
-        # Kalman
         self.k_q_angle = 0.001
         self.k_q_bias = 0.003
         self.k_r_meas = 0.03
@@ -323,211 +291,104 @@ params = Params()
 def get_params():
     with param_lock:
         return {
-            "kp": params.kp,
-            "ki": params.ki,
-            "kd": params.kd,
+            "kp": params.kp, "ki": params.ki, "kd": params.kd,
             "i_lim": params.i_lim,
             "bal_max_rpm": params.bal_max_rpm,
             "max_rpm_step": params.max_rpm_step,
-            "acc_tau": params.acc_tau,
-            "gyro_tau": params.gyro_tau,
-            "k_q_angle": params.k_q_angle,
-            "k_q_bias": params.k_q_bias,
-            "k_r_meas": params.k_r_meas,
+            "acc_tau": params.acc_tau, "gyro_tau": params.gyro_tau,
+            "k_q_angle": params.k_q_angle, "k_q_bias": params.k_q_bias, "k_r_meas": params.k_r_meas,
             "invert_gyro": params.invert_gyro,
         }
 
 def set_params(d: dict):
     with param_lock:
-        if "kp" in d: params.kp = float(d["kp"])
-        if "ki" in d: params.ki = float(d["ki"])
-        if "kd" in d: params.kd = float(d["kd"])
-        if "i_lim" in d: params.i_lim = float(d["i_lim"])
-        if "bal_max_rpm" in d: params.bal_max_rpm = float(d["bal_max_rpm"])
-        if "max_rpm_step" in d: params.max_rpm_step = float(d["max_rpm_step"])
-        if "acc_tau" in d: params.acc_tau = float(d["acc_tau"])
-        if "gyro_tau" in d: params.gyro_tau = float(d["gyro_tau"])
-        if "k_q_angle" in d: params.k_q_angle = float(d["k_q_angle"])
-        if "k_q_bias" in d: params.k_q_bias = float(d["k_q_bias"])
-        if "k_r_meas" in d: params.k_r_meas = float(d["k_r_meas"])
-        if "invert_gyro" in d: params.invert_gyro = bool(d["invert_gyro"])
+        for k in ("kp","ki","kd","i_lim","bal_max_rpm","max_rpm_step","acc_tau","gyro_tau","k_q_angle","k_q_bias","k_r_meas"):
+            if k in d:
+                setattr(params, k, float(d[k]))
+        if "invert_gyro" in d:
+            params.invert_gyro = bool(d["invert_gyro"])
 
-
-# ===================== WEB SERVER =====================
 def start_web_server():
     web_require()
     app = Flask(__name__)
 
-    HTML = f"""
-<!doctype html>
-<html lang="es">
-<head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>Balance PID + Filtros IMU</title>
-  <style>
-    body {{ font-family: sans-serif; margin: 20px; max-width: 920px; }}
-    .row {{ margin: 16px 0; }}
-    .label {{ display:flex; justify-content:space-between; margin-bottom: 6px; }}
-    input[type=range] {{ width: 100%; }}
-    .box {{ padding: 12px; border: 1px solid #ddd; border-radius: 12px; }}
-    .small {{ color:#555; font-size: 0.95em; line-height: 1.35; }}
-    code {{ background:#f6f6f6; padding:2px 6px; border-radius:6px; }}
-    h2 {{ margin-bottom: 8px; }}
-    h3 {{ margin: 16px 0 6px; }}
-  </style>
-</head>
-<body>
-  <h2>Self-Balancing (SIN mando): PID + Filtros IMU + Kalman</h2>
-  <div class="box">
-    <h3>PID</h3>
-    <div class="row">
-      <div class="label"><b>Kp</b><span id="kpv"></span></div>
-      <input id="kp" type="range" min="{KP_RANGE[0]}" max="{KP_RANGE[1]}" step="0.1">
-    </div>
-    <div class="row">
-      <div class="label"><b>Ki</b><span id="kiv"></span></div>
-      <input id="ki" type="range" min="{KI_RANGE[0]}" max="{KI_RANGE[1]}" step="0.01">
-    </div>
-    <div class="row">
-      <div class="label"><b>Kd</b><span id="kdv"></span></div>
-      <input id="kd" type="range" min="{KD_RANGE[0]}" max="{KD_RANGE[1]}" step="0.1">
-    </div>
+    HTML = f"""<!doctype html><html lang="es"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Balance PID + Filtros IMU</title>
+<style>
+body {{ font-family:sans-serif; margin:20px; max-width:920px; }}
+.row {{ margin:16px 0; }}
+.label {{ display:flex; justify-content:space-between; margin-bottom:6px; }}
+input[type=range] {{ width:100%; }}
+.box {{ padding:12px; border:1px solid #ddd; border-radius:12px; }}
+.small {{ color:#555; font-size:0.95em; line-height:1.35; }}
+</style></head><body>
+<h2>Self-Balancing (SIN mando): PID + Filtros IMU + Kalman</h2>
+<div class="box">
+<h3>PID</h3>
+<div class="row"><div class="label"><b>Kp</b><span id="kpv"></span></div><input id="kp" type="range" min="{KP_RANGE[0]}" max="{KP_RANGE[1]}" step="0.1"></div>
+<div class="row"><div class="label"><b>Ki</b><span id="kiv"></span></div><input id="ki" type="range" min="{KI_RANGE[0]}" max="{KI_RANGE[1]}" step="0.01"></div>
+<div class="row"><div class="label"><b>Kd</b><span id="kdv"></span></div><input id="kd" type="range" min="{KD_RANGE[0]}" max="{KD_RANGE[1]}" step="0.1"></div>
 
-    <h3>Estabilidad</h3>
-    <div class="row">
-      <div class="label"><b>BAL_MAX_RPM</b><span id="balv"></span></div>
-      <input id="bal" type="range" min="{BAL_MAX_RPM_RANGE[0]}" max="{BAL_MAX_RPM_RANGE[1]}" step="1">
-    </div>
-    <div class="row">
-      <div class="label"><b>Slew rpm/s</b><span id="slewv"></span></div>
-      <input id="slew" type="range" min="{SLEW_RANGE[0]}" max="{SLEW_RANGE[1]}" step="10">
-    </div>
-    <div class="row">
-      <div class="label"><b>I_LIM</b><span id="ilimv"></span></div>
-      <input id="ilim" type="range" min="{I_LIM_RANGE[0]}" max="{I_LIM_RANGE[1]}" step="1">
-    </div>
+<h3>Estabilidad</h3>
+<div class="row"><div class="label"><b>BAL_MAX_RPM</b><span id="balv"></span></div><input id="bal" type="range" min="{BAL_MAX_RPM_RANGE[0]}" max="{BAL_MAX_RPM_RANGE[1]}" step="1"></div>
+<div class="row"><div class="label"><b>Slew rpm/s</b><span id="slewv"></span></div><input id="slew" type="range" min="{SLEW_RANGE[0]}" max="{SLEW_RANGE[1]}" step="10"></div>
+<div class="row"><div class="label"><b>I_LIM</b><span id="ilimv"></span></div><input id="ilim" type="range" min="{I_LIM_RANGE[0]}" max="{I_LIM_RANGE[1]}" step="1"></div>
 
-    <h3>Filtros IMU (pre-Kalman)</h3>
-    <div class="row">
-      <div class="label"><b>ACC_TAU (s)</b><span id="acctauv"></span></div>
-      <input id="acctau" type="range" min="{ACC_TAU_RANGE[0]}" max="{ACC_TAU_RANGE[1]}" step="0.005">
-    </div>
-    <div class="row">
-      <div class="label"><b>GYRO_TAU (s)</b><span id="gyrotauv"></span></div>
-      <input id="gyrotau" type="range" min="{GYRO_TAU_RANGE[0]}" max="{GYRO_TAU_RANGE[1]}" step="0.005">
-    </div>
+<h3>Filtros IMU</h3>
+<div class="row"><div class="label"><b>ACC_TAU (s)</b><span id="acctauv"></span></div><input id="acctau" type="range" min="{ACC_TAU_RANGE[0]}" max="{ACC_TAU_RANGE[1]}" step="0.005"></div>
+<div class="row"><div class="label"><b>GYRO_TAU (s)</b><span id="gyrotauv"></span></div><input id="gyrotau" type="range" min="{GYRO_TAU_RANGE[0]}" max="{GYRO_TAU_RANGE[1]}" step="0.005"></div>
 
-    <h3>Kalman</h3>
-    <div class="row">
-      <div class="label"><b>Q_angle</b><span id="qav"></span></div>
-      <input id="qa" type="range" min="{K_QA_RANGE[0]}" max="{K_QA_RANGE[1]}" step="0.000001">
-    </div>
-    <div class="row">
-      <div class="label"><b>Q_bias</b><span id="qbv"></span></div>
-      <input id="qb" type="range" min="{K_QB_RANGE[0]}" max="{K_QB_RANGE[1]}" step="0.000001">
-    </div>
-    <div class="row">
-      <div class="label"><b>R_measure</b><span id="rmv"></span></div>
-      <input id="rm" type="range" min="{K_RM_RANGE[0]}" max="{K_RM_RANGE[1]}" step="0.0001">
-    </div>
+<h3>Kalman</h3>
+<div class="row"><div class="label"><b>Q_angle</b><span id="qav"></span></div><input id="qa" type="range" min="{K_QA_RANGE[0]}" max="{K_QA_RANGE[1]}" step="0.000001"></div>
+<div class="row"><div class="label"><b>Q_bias</b><span id="qbv"></span></div><input id="qb" type="range" min="{K_QB_RANGE[0]}" max="{K_QB_RANGE[1]}" step="0.000001"></div>
+<div class="row"><div class="label"><b>R_measure</b><span id="rmv"></span></div><input id="rm" type="range" min="{K_RM_RANGE[0]}" max="{K_RM_RANGE[1]}" step="0.0001"></div>
 
-    <div class="row">
-      <label><input id="invgyro" type="checkbox"> Invertir signo gyro_rate</label>
-    </div>
-
-    <div class="small">
-      Derivada del PID: <code>derr</code> directa (sin filtro D_TAU). El avance está anulado: <code>setpoint=0°</code>.
-    </div>
-  </div>
+<div class="row"><label><input id="invgyro" type="checkbox"> Invertir signo gyro_rate</label></div>
+<div class="small">Setpoint fijo 0°. Derivada sin filtro.</div>
+</div>
 
 <script>
-async function getP() {{
-  const r = await fetch('/params');
-  return await r.json();
-}}
-async function setP(p) {{
-  await fetch('/params', {{
-    method: 'POST',
-    headers: {{'Content-Type':'application/json'}},
-    body: JSON.stringify(p)
-  }});
-}}
-function bindSlider(id, labId, fmt) {{
-  const s = document.getElementById(id);
-  const l = document.getElementById(labId);
-  const upd = () => l.textContent = fmt(parseFloat(s.value));
-  s.addEventListener('input', upd);
-  return {{slider:s, updateLabel:upd}};
-}}
+async function getP(){{ const r=await fetch('/params'); return await r.json(); }}
+async function setP(p){{ await fetch('/params',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(p)}}); }}
+function bind(id, vid, fmt){{ const s=document.getElementById(id); const v=document.getElementById(vid);
+const upd=()=>v.textContent=fmt(parseFloat(s.value)); s.addEventListener('input',upd); return {{s,upd}}; }}
 
-(async () => {{
-  const p = await getP();
+(async()=>{{
+  const p=await getP();
+  const kp=bind('kp','kpv',x=>x.toFixed(1));
+  const ki=bind('ki','kiv',x=>x.toFixed(2));
+  const kd=bind('kd','kdv',x=>x.toFixed(2));
+  const bal=bind('bal','balv',x=>x.toFixed(0));
+  const slew=bind('slew','slewv',x=>x.toFixed(0));
+  const ilim=bind('ilim','ilimv',x=>x.toFixed(0));
+  const acctau=bind('acctau','acctauv',x=>x.toFixed(3));
+  const gyrotau=bind('gyrotau','gyrotauv',x=>x.toFixed(3));
+  const qa=bind('qa','qav',x=>x.toExponential(3));
+  const qb=bind('qb','qbv',x=>x.toExponential(3));
+  const rm=bind('rm','rmv',x=>x.toExponential(3));
+  const inv=document.getElementById('invgyro');
 
-  const kp = bindSlider('kp','kpv',v=>v.toFixed(1));
-  const ki = bindSlider('ki','kiv',v=>v.toFixed(2));
-  const kd = bindSlider('kd','kdv',v=>v.toFixed(2));
+  kp.s.value=p.kp; kp.upd(); ki.s.value=p.ki; ki.upd(); kd.s.value=p.kd; kd.upd();
+  bal.s.value=p.bal_max_rpm; bal.upd(); slew.s.value=p.max_rpm_step; slew.upd(); ilim.s.value=p.i_lim; ilim.upd();
+  acctau.s.value=p.acc_tau; acctau.upd(); gyrotau.s.value=p.gyro_tau; gyrotau.upd();
+  qa.s.value=p.k_q_angle; qa.upd(); qb.s.value=p.k_q_bias; qb.upd(); rm.s.value=p.k_r_meas; rm.upd();
+  inv.checked=!!p.invert_gyro;
 
-  const bal = bindSlider('bal','balv',v=>v.toFixed(0));
-  const slew = bindSlider('slew','slewv',v=>v.toFixed(0));
-  const ilim = bindSlider('ilim','ilimv',v=>v.toFixed(0));
-
-  const acctau = bindSlider('acctau','acctauv',v=>v.toFixed(3));
-  const gyrotau = bindSlider('gyrotau','gyrotauv',v=>v.toFixed(3));
-
-  const qa = bindSlider('qa','qav',v=>v.toExponential(3));
-  const qb = bindSlider('qb','qbv',v=>v.toExponential(3));
-  const rm = bindSlider('rm','rmv',v=>v.toExponential(3));
-
-  const invgyro = document.getElementById('invgyro');
-
-  kp.slider.value = p.kp; kp.updateLabel();
-  ki.slider.value = p.ki; ki.updateLabel();
-  kd.slider.value = p.kd; kd.updateLabel();
-
-  bal.slider.value = p.bal_max_rpm; bal.updateLabel();
-  slew.slider.value = p.max_rpm_step; slew.updateLabel();
-  ilim.slider.value = p.i_lim; ilim.updateLabel();
-
-  acctau.slider.value = p.acc_tau; acctau.updateLabel();
-  gyrotau.slider.value = p.gyro_tau; gyrotau.updateLabel();
-
-  qa.slider.value = p.k_q_angle; qa.updateLabel();
-  qb.slider.value = p.k_q_bias; qb.updateLabel();
-  rm.slider.value = p.k_r_meas; rm.updateLabel();
-
-  invgyro.checked = !!p.invert_gyro;
-
-  let t = null;
-  const push = () => {{
-    clearTimeout(t);
-    t = setTimeout(() => {{
-      setP({{
-        kp: parseFloat(kp.slider.value),
-        ki: parseFloat(ki.slider.value),
-        kd: parseFloat(kd.slider.value),
-        bal_max_rpm: parseFloat(bal.slider.value),
-        max_rpm_step: parseFloat(slew.slider.value),
-        i_lim: parseFloat(ilim.slider.value),
-        acc_tau: parseFloat(acctau.slider.value),
-        gyro_tau: parseFloat(gyrotau.slider.value),
-        k_q_angle: parseFloat(qa.slider.value),
-        k_q_bias: parseFloat(qb.slider.value),
-        k_r_meas: parseFloat(rm.slider.value),
-        invert_gyro: invgyro.checked
-      }});
-    }}, 120);
-  }};
-
-  for (const s of [kp.slider,ki.slider,kd.slider,bal.slider,slew.slider,ilim.slider,acctau.slider,gyrotau.slider,qa.slider,qb.slider,rm.slider]) {{
-    s.addEventListener('input', push);
-  }}
-  invgyro.addEventListener('change', push);
+  let t=null;
+  const push=()=>{{ clearTimeout(t); t=setTimeout(()=>{{
+    setP({{
+      kp:parseFloat(kp.s.value), ki:parseFloat(ki.s.value), kd:parseFloat(kd.s.value),
+      bal_max_rpm:parseFloat(bal.s.value), max_rpm_step:parseFloat(slew.s.value), i_lim:parseFloat(ilim.s.value),
+      acc_tau:parseFloat(acctau.s.value), gyro_tau:parseFloat(gyrotau.s.value),
+      k_q_angle:parseFloat(qa.s.value), k_q_bias:parseFloat(qb.s.value), k_r_meas:parseFloat(rm.s.value),
+      invert_gyro:inv.checked
+    }});
+  }},120); }};
+  for (const el of [kp.s,ki.s,kd.s,bal.s,slew.s,ilim.s,acctau.s,gyrotau.s,qa.s,qb.s,rm.s]) el.addEventListener('input',push);
+  inv.addEventListener('change',push);
 }})();
-</script>
-</body>
-</html>
-"""
+</script></body></html>"""
 
     @app.get("/")
     def index():
@@ -550,18 +411,10 @@ function bindSlider(id, labId, fmt) {{
                     return
                 d[name] = clamp(d[name], lo, hi)
 
-        fclamp("kp", *KP_RANGE)
-        fclamp("ki", *KI_RANGE)
-        fclamp("kd", *KD_RANGE)
-        fclamp("bal_max_rpm", *BAL_MAX_RPM_RANGE)
-        fclamp("max_rpm_step", *SLEW_RANGE)
-        fclamp("i_lim", *I_LIM_RANGE)
-        fclamp("acc_tau", *ACC_TAU_RANGE)
-        fclamp("gyro_tau", *GYRO_TAU_RANGE)
-        fclamp("k_q_angle", *K_QA_RANGE)
-        fclamp("k_q_bias", *K_QB_RANGE)
-        fclamp("k_r_meas", *K_RM_RANGE)
-
+        fclamp("kp", *KP_RANGE); fclamp("ki", *KI_RANGE); fclamp("kd", *KD_RANGE)
+        fclamp("bal_max_rpm", *BAL_MAX_RPM_RANGE); fclamp("max_rpm_step", *SLEW_RANGE); fclamp("i_lim", *I_LIM_RANGE)
+        fclamp("acc_tau", *ACC_TAU_RANGE); fclamp("gyro_tau", *GYRO_TAU_RANGE)
+        fclamp("k_q_angle", *K_QA_RANGE); fclamp("k_q_bias", *K_QB_RANGE); fclamp("k_r_meas", *K_RM_RANGE)
         if "invert_gyro" in d:
             d["invert_gyro"] = bool(d["invert_gyro"])
 
@@ -570,14 +423,12 @@ function bindSlider(id, labId, fmt) {{
 
     app.run(host=WEB_HOST, port=WEB_PORT, debug=False, use_reloader=False, threaded=True)
 
-
-# ===================== MAIN =====================
 def main() -> int:
     if SMBus is None:
-        print("ERROR: smbus2/smbus no instalado. Instala: pip3 install smbus2", file=sys.stderr)
+        print("ERROR: smbus2/smbus no instalado. pip3 install smbus2", file=sys.stderr)
         return 1
     if Flask is None:
-        print("ERROR: Flask no instalado. Instala: pip3 install flask", file=sys.stderr)
+        print("ERROR: Flask no instalado. pip3 install flask", file=sys.stderr)
         return 1
 
     threading.Thread(target=start_web_server, daemon=True).start()
@@ -594,7 +445,6 @@ def main() -> int:
     kf = Kalman1D(params.k_q_angle, params.k_q_bias, params.k_r_meas)
     kf.set_angle(0.0)
 
-    # filtros pre-kalman
     accel_angle_f = 0.0
     gyro_rate_f = 0.0
 
@@ -607,44 +457,80 @@ def main() -> int:
     prev_err = 0.0
     base_rpm_cmd = 0.0
 
+    imu_err_streak = 0
+
     period = 1.0 / UPDATE_HZ
     t_next = time.monotonic()
     t_prev = t_next
 
+    start_t = time.monotonic()
+    last_alive_print = start_t
+
     try:
         while True:
-            now = time.monotonic()
-            dt = now - t_prev
-            t_prev = now
-            if dt < 0.0:
-                dt = 0.0
-            elif dt > DT_MAX:
-                dt = DT_MAX
+            try:
+                now = time.monotonic()
+                dt = now - t_prev
+                t_prev = now
+                if dt < 0.0:
+                    dt = 0.0
+                elif dt > DT_MAX:
+                    dt = DT_MAX
 
-            p = get_params()
-            kf.set_params(p["k_q_angle"], p["k_q_bias"], p["k_r_meas"])
+                p = get_params()
+                kf.set_params(p["k_q_angle"], p["k_q_bias"], p["k_r_meas"])
 
-            ax, az, gy_raw = read_accel_gyro(bus)
-            accel_angle = accel_angle_deg_from_ax_az(ax, az) - accel_zero_deg
-            gyro_rate = (gy_raw / GYRO_LSB_PER_DPS) - gyro_y_bias_dps
-            if p["invert_gyro"]:
-                gyro_rate = -gyro_rate
+                ax, az, gy_raw = read_accel_gyro(bus)
+                accel_angle = accel_angle_deg_from_ax_az(ax, az) - accel_zero_deg
+                gyro_rate = (gy_raw / GYRO_LSB_PER_DPS) - gyro_y_bias_dps
+                if p["invert_gyro"]:
+                    gyro_rate = -gyro_rate
 
-            accel_angle_f = lpf_update(accel_angle_f, accel_angle, p["acc_tau"], dt)
-            gyro_rate_f = lpf_update(gyro_rate_f, gyro_rate, p["gyro_tau"], dt)
+                accel_angle_f = lpf_update(accel_angle_f, accel_angle, p["acc_tau"], dt)
+                gyro_rate_f = lpf_update(gyro_rate_f, gyro_rate, p["gyro_tau"], dt)
 
-            angle = kf.update(accel_angle_f, gyro_rate_f, dt)
+                angle = kf.update(accel_angle_f, gyro_rate_f, dt)
 
-            # Safety
-            if abs(angle) > ANGLE_CUTOFF_DEG:
-                send_paced(ser, cmd_speed(ADDR_LEFT, 0, 0))
-                send_paced(ser, cmd_speed(ADDR_RIGHT, 0, 0))
-                integ = 0.0
-                prev_err = 0.0
-                base_rpm_cmd = 0.0
+                imu_err_streak = 0  # lectura ok
 
-                sys.stdout.write(f"\rCAIDO: Ang={angle:+07.2f} deg -> motores 0 rpm                         ")
-                sys.stdout.flush()
+                if abs(angle) > ANGLE_CUTOFF_DEG:
+                    send_paced(ser, cmd_speed(ADDR_LEFT, 0, 0))
+                    send_paced(ser, cmd_speed(ADDR_RIGHT, 0, 0))
+                    integ = 0.0
+                    prev_err = 0.0
+                    base_rpm_cmd = 0.0
+                    sys.stdout.write(f"\rCAIDO: Ang={angle:+07.2f} deg -> motores 0 rpm                         ")
+                    sys.stdout.flush()
+                else:
+                    err = SETPOINT_DEG - angle
+                    integ += err * dt
+                    integ = clamp(integ, -p["i_lim"], +p["i_lim"])
+
+                    derr = (err - prev_err) / dt if dt > 0 else 0.0
+                    prev_err = err
+
+                    base_rpm = (p["kp"] * err) + (p["ki"] * integ) + (p["kd"] * derr)
+                    base_rpm = clamp(base_rpm, -p["bal_max_rpm"], +p["bal_max_rpm"])
+
+                    max_step = p["max_rpm_step"] * dt
+                    base_rpm_cmd += clamp(base_rpm - base_rpm_cmd, -max_step, +max_step)
+                    base_rpm_cmd = clamp(base_rpm_cmd, -p["bal_max_rpm"], +p["bal_max_rpm"])
+
+                    mc = motors_from_balance(base_rpm_cmd)
+                    send_paced(ser, cmd_speed(ADDR_LEFT, mc.left_rpm, ACC))
+                    send_paced(ser, cmd_speed(ADDR_RIGHT, mc.right_rpm, ACC))
+
+                    sys.stdout.write(
+                        f"\rAng={angle:+07.2f} | AccF={accel_angle_f:+07.2f} | GyF={gyro_rate_f:+07.2f} | "
+                        f"err={err:+07.2f} | base={base_rpm_cmd:+06.1f} | "
+                        f"L={mc.left_rpm:+04d} R={mc.right_rpm:+04d}    "
+                    )
+                    sys.stdout.flush()
+
+                # “alive” cada 5 s
+                if now - last_alive_print > 5.0:
+                    last_alive_print = now
+                    print(f"\n[alive] t={now-start_t:.1f}s imu_err_streak={imu_err_streak}")
 
                 t_next += period
                 sleep_s = t_next - time.monotonic()
@@ -652,48 +538,24 @@ def main() -> int:
                     time.sleep(sleep_s)
                 else:
                     t_next = time.monotonic()
-                continue
 
-            # PID (sin mando): setpoint fijo 0°
-            setpoint = SETPOINT_DEG
-            err = setpoint - angle
+            except Exception as e:
+                imu_err_streak += 1
+                print(f"\n[ERROR loop] {type(e).__name__}: {e}", file=sys.stderr)
+                traceback.print_exc()
 
-            integ += err * dt
-            integ = clamp(integ, -p["i_lim"], +p["i_lim"])
+                if IMU_ERROR_MOTOR_ZERO:
+                    try:
+                        send_paced(ser, cmd_speed(ADDR_LEFT, 0, 0))
+                        send_paced(ser, cmd_speed(ADDR_RIGHT, 0, 0))
+                    except Exception:
+                        pass
 
-            derr = (err - prev_err) / dt if dt > 0 else 0.0
-            prev_err = err
+                if imu_err_streak >= IMU_MAX_CONSECUTIVE_ERRORS:
+                    print("\n[ERROR] demasiados fallos IMU seguidos -> saliendo (seguro)", file=sys.stderr)
+                    break
 
-            base_rpm = (p["kp"] * err) + (p["ki"] * integ) + (p["kd"] * derr)
-            base_rpm = clamp(base_rpm, -p["bal_max_rpm"], +p["bal_max_rpm"])
-
-            # Slew-rate
-            max_step = p["max_rpm_step"] * dt
-            base_rpm_cmd += clamp(base_rpm - base_rpm_cmd, -max_step, +max_step)
-            base_rpm_cmd = clamp(base_rpm_cmd, -p["bal_max_rpm"], +p["bal_max_rpm"])
-
-            mc = motors_from_balance(base_rpm_cmd)
-
-            send_paced(ser, cmd_speed(ADDR_LEFT, mc.left_rpm, ACC))
-            send_paced(ser, cmd_speed(ADDR_RIGHT, mc.right_rpm, ACC))
-
-            sys.stdout.write(
-                f"\rAng={angle:+07.2f} | AccF={accel_angle_f:+07.2f} | GyF={gyro_rate_f:+07.2f} | "
-                f"err={err:+07.2f} | base={base_rpm_cmd:+06.1f} | "
-                f"PID({p['kp']:.1f},{p['ki']:.2f},{p['kd']:.2f}) | "
-                f"ACC_TAU={p['acc_tau']:.3f} GY_TAU={p['gyro_tau']:.3f} | "
-                f"K(qA={p['k_q_angle']:.4g},qB={p['k_q_bias']:.4g},rM={p['k_r_meas']:.4g}) | "
-                f"L={mc.left_rpm:+04d} R={mc.right_rpm:+04d}     "
-            )
-            sys.stdout.flush()
-
-            # timing
-            t_next += period
-            sleep_s = t_next - time.monotonic()
-            if sleep_s > 0:
-                time.sleep(sleep_s)
-            else:
-                t_next = time.monotonic()
+                time.sleep(IMU_ERROR_SLEEP_S)
 
     except KeyboardInterrupt:
         print("\nCTRL+C -> Parando motores...")
@@ -718,7 +580,6 @@ def main() -> int:
             pass
 
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())
