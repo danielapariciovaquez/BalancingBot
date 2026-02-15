@@ -13,18 +13,15 @@ from flask import Flask, jsonify, Response, request
 I2C_BUS = 1
 MPU_ADDR = 0x68
 
-READ_HZ = 200          # lectura IMU backend
-WEB_POLL_MS = 100      # refresco web (ms)
+READ_HZ = 200
+WEB_POLL_MS = 100
 
 HTTP_HOST = "0.0.0.0"
 HTTP_PORT = 5000
 
-# Escalas por defecto (reset):
-# accel FS=±2g, gyro FS=±250°/s
-ACCEL_SCALE = 16384.0  # LSB/g
-GYRO_SCALE = 131.0     # LSB/(°/s)
+ACCEL_SCALE = 16384.0
+GYRO_SCALE = 131.0
 
-# Registros MPU6050
 PWR_MGMT_1 = 0x6B
 ACCEL_XOUT_H = 0x3B
 # ==================================================
@@ -35,18 +32,17 @@ def _to_int16(v: int) -> int:
     return v - 0x10000 if (v & 0x8000) else v
 
 def lpf_alpha(dt: float, tau: float) -> float:
-    # IIR 1er orden: y += a*(x-y), a = dt/(tau+dt). tau<=0 => sin filtro.
     if tau <= 0.0:
         return 1.0
     return dt / (tau + dt)
 
 @dataclass
 class Params:
-    tau_acc: float = 0.10     # s, LPF sobre (Ax,Ay,Az)
-    tau_gyro: float = 0.02    # s, LPF sobre Gy
-    alpha_comp: float = 0.98  # complementario
-    invert_gyro: bool = False # invierte signo de Gy si está montado al revés
-    invert_angle: bool = False# invierte signo del ángulo final (pitch) si conviene
+    tau_acc: float = 0.10
+    tau_gyro: float = 0.02
+    alpha_comp: float = 0.98
+    invert_gyro: bool = False
+    invert_angle: bool = False
 
 params = Params()
 params_lock = threading.Lock()
@@ -55,11 +51,6 @@ params_lock = threading.Lock()
 class PitchState:
     ts: float = 0.0
     dt: float = 0.0
-
-    ax_g_raw: float = 0.0
-    ay_g_raw: float = 0.0
-    az_g_raw: float = 0.0
-    gy_dps_raw: float = 0.0
 
     ax_g_f: float = 0.0
     ay_g_f: float = 0.0
@@ -80,9 +71,8 @@ reset_evt = threading.Event()
 
 
 def imu_thread():
-    global state
-
     period = 1.0 / float(READ_HZ)
+
     try:
         bus = SMBus(I2C_BUS)
     except Exception as e:
@@ -92,7 +82,7 @@ def imu_thread():
         return
 
     try:
-        bus.write_byte_data(MPU_ADDR, PWR_MGMT_1, 0x00)  # wake
+        bus.write_byte_data(MPU_ADDR, PWR_MGMT_1, 0x00)
     except Exception as e:
         with state_lock:
             state.ok = False
@@ -103,7 +93,6 @@ def imu_thread():
             pass
         return
 
-    # Memorias filtro
     ax_f = ay_f = az_f = 0.0
     gy_f = 0.0
     pitch_gyro = 0.0
@@ -130,8 +119,7 @@ def imu_thread():
             ay = _to_int16((data[2] << 8) | data[3]) / ACCEL_SCALE
             az = _to_int16((data[4] << 8) | data[5]) / ACCEL_SCALE
 
-            # gyro Y (bytes 10..11)
-            gy = _to_int16((data[10] << 8) | data[11]) / GYRO_SCALE
+            gy = _to_int16((data[10] << 8) | data[11]) / GYRO_SCALE  # Gy
 
             with params_lock:
                 tau_acc = float(params.tau_acc)
@@ -151,43 +139,27 @@ def imu_thread():
             az_f = az_f + a_acc * (az - az_f)
             gy_f = gy_f + a_gyr * (gy - gy_f)
 
-            # PITCH desde accel: atan2(-Ax, sqrt(Ay^2 + Az^2)) (deg)
             denom = math.sqrt(ay_f * ay_f + az_f * az_f)
             pitch_acc = math.degrees(math.atan2(-ax_f, denom))
 
-            # Integración gyro (Gy)
             pitch_gyro += gy_f * dt
-
-            # Complementario (estado)
             pitch_fused = alpha * (pitch_fused + gy_f * dt) + (1.0 - alpha) * pitch_acc
 
             if inv_a:
-                pitch_acc_out = -pitch_acc
-                pitch_gyro_out = -pitch_gyro
-                pitch_fused_out = -pitch_fused
-            else:
-                pitch_acc_out = pitch_acc
-                pitch_gyro_out = pitch_gyro
-                pitch_fused_out = pitch_fused
+                pitch_acc = -pitch_acc
+                pitch_gyro = -pitch_gyro
+                pitch_fused = -pitch_fused
 
             with state_lock:
                 state.ts = t0
                 state.dt = dt
-
-                state.ax_g_raw = float(ax)
-                state.ay_g_raw = float(ay)
-                state.az_g_raw = float(az)
-                state.gy_dps_raw = float(gy)
-
                 state.ax_g_f = float(ax_f)
                 state.ay_g_f = float(ay_f)
                 state.az_g_f = float(az_f)
                 state.gy_dps_f = float(gy_f)
-
-                state.pitch_acc_deg = float(pitch_acc_out)
-                state.pitch_gyro_deg = float(pitch_gyro_out)
-                state.pitch_fused_deg = float(pitch_fused_out)
-
+                state.pitch_acc_deg = float(pitch_acc)
+                state.pitch_gyro_deg = float(pitch_gyro)
+                state.pitch_fused_deg = float(pitch_fused)
                 state.ok = True
                 state.err = ""
 
@@ -199,7 +171,6 @@ def imu_thread():
                 state.err = repr(e)
             time.sleep(0.05)
 
-        # pacing
         loop_dt = time.time() - t0
         sleep_s = period - loop_dt
         if sleep_s > 0:
@@ -245,34 +216,31 @@ def api_reset():
 
 @app.get("/")
 def index():
-    html = f"""<!doctype html>
+    html = """<!doctype html>
 <html lang="es">
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>MPU6050 — Pitch (deg) + filtrado</title>
   <style>
-    body {{ font-family: system-ui, sans-serif; margin: 20px; }}
-    .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 16px; max-width: 980px; }}
-    .card {{ border: 1px solid #ddd; border-radius: 10px; padding: 14px; }}
-    .title {{ font-weight: 700; margin-bottom: 10px; }}
-    .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }}
-    .ok {{ color: #0a7; font-weight: 700; }}
-    .bad {{ color: #c22; font-weight: 700; }}
-    .row {{ display:flex; gap:12px; align-items:center; margin: 10px 0; flex-wrap: wrap; }}
-    input[type=range] {{ width: 320px; }}
-    .small {{ color:#666; font-size: 12px; }}
-    table {{ width:100%; border-collapse: collapse; }}
-    td {{ padding: 6px 0; }}
-    td.k {{ width: 170px; color:#555; }}
+    body { font-family: system-ui, sans-serif; margin: 20px; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; max-width: 980px; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 14px; }
+    .title { font-weight: 700; margin-bottom: 10px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .ok { color: #0a7; font-weight: 700; }
+    .bad { color: #c22; font-weight: 700; }
+    .row { display:flex; gap:12px; align-items:center; margin: 10px 0; flex-wrap: wrap; }
+    input[type=range] { width: 320px; }
+    .small { color:#666; font-size: 12px; }
+    table { width:100%; border-collapse: collapse; }
+    td { padding: 6px 0; }
+    td.k { width: 170px; color:#555; }
   </style>
 </head>
 <body>
   <h2>MPU6050 (GY-521) — Pitch (deg) + filtrado</h2>
-  <div class="small">
-    Backend: {READ_HZ} Hz · Web: {int(WEB_POLL_MS)} ms · I2C addr: 0x{MPU_ADDR:02X}<br>
-    Pitch_acc = atan2(-Ax, sqrt(Ay²+Az²)) · Gyro usado: Gy
-  </div>
+  <div class="small" id="meta"></div>
 
   <div style="margin:10px 0">
     Estado: <span id="status" class="mono">...</span>
@@ -337,49 +305,55 @@ def index():
   </div>
 
 <script>
-const POLL_MS = {int(WEB_POLL_MS)};
+const READ_HZ = __READ_HZ__;
+const WEB_POLL_MS = __WEB_POLL_MS__;
+const MPU_ADDR = "__MPU_ADDR__";
+
+document.getElementById("meta").textContent =
+  `Backend: ${READ_HZ} Hz · Web: ${WEB_POLL_MS} ms · I2C addr: ${MPU_ADDR} · Pitch_acc = atan2(-Ax, sqrt(Ay^2+Az^2)) · Gyro: Gy`;
+
 const fmt = (v, n=4) => (typeof v === "number" ? v.toFixed(n) : String(v));
 
-async function postJSON(url, obj){{
-  await fetch(url, {{
+async function postJSON(url, obj){
+  await fetch(url, {
     method: "POST",
-    headers: {{"Content-Type":"application/json"}},
+    headers: {"Content-Type":"application/json"},
     body: JSON.stringify(obj)
-  }});
-}}
+  });
+}
 
-function bindSlider(id, outId, key){{
+function bindSlider(id, outId, key){
   const s = document.getElementById(id);
   const o = document.getElementById(outId);
-  const send = async ()=> {{
+  const send = async ()=> {
     const v = Number(s.value);
     o.textContent = fmt(v, 3);
-    const payload = {{}};
+    const payload = {};
     payload[key] = v;
     await postJSON("/api/params", payload);
-  }};
-  s.addEventListener("input", ()=>{{ o.textContent = fmt(Number(s.value), 3); }});
+  };
+  s.addEventListener("input", ()=>{ o.textContent = fmt(Number(s.value), 3); });
   s.addEventListener("change", send);
-}}
+}
 
 bindSlider("tauAcc","tauAccV","tau_acc");
 bindSlider("tauGyr","tauGyrV","tau_gyro");
 bindSlider("alpha","alphaV","alpha_comp");
 
 document.getElementById("invGyro").addEventListener("change", async (e)=>{
-  await postJSON("/api/params", {{invert_gyro: e.target.checked}});
+  await postJSON("/api/params", {invert_gyro: e.target.checked});
 });
 document.getElementById("invAng").addEventListener("change", async (e)=>{
-  await postJSON("/api/params", {{invert_angle: e.target.checked}});
+  await postJSON("/api/params", {invert_angle: e.target.checked});
 });
 
 document.getElementById("btnReset").addEventListener("click", async ()=>{
-  await fetch("/api/reset", {{method:"POST"}});
+  await fetch("/api/reset", {method:"POST"});
 });
 
-async function tick(){{
-  try {{
-    const r = await fetch("/api/pitch", {{cache:"no-store"}});
+async function tick(){
+  try {
+    const r = await fetch("/api/pitch", {cache:"no-store"});
     const d = await r.json();
     const s = d.state;
 
@@ -396,29 +370,32 @@ async function tick(){{
     document.getElementById("dt").textContent = fmt(s.dt, 4);
 
     const st = document.getElementById("status");
-    if (s.ok) {{
+    if (s.ok) {
       st.textContent = "OK";
       st.className = "mono ok";
       document.getElementById("err").textContent = "-";
-    }} else {{
+    } else {
       st.textContent = "ERROR";
       st.className = "mono bad";
       document.getElementById("err").textContent = s.err || "-";
-    }}
-  }} catch (e) {{
+    }
+  } catch (e) {
     const st = document.getElementById("status");
     st.textContent = "HTTP ERROR";
     st.className = "mono bad";
     document.getElementById("err").textContent = String(e);
-  }}
-}}
+  }
+}
 
 tick();
-setInterval(tick, POLL_MS);
+setInterval(tick, WEB_POLL_MS);
 </script>
 </body>
 </html>
 """
+    html = html.replace("__READ_HZ__", str(READ_HZ))
+    html = html.replace("__WEB_POLL_MS__", str(int(WEB_POLL_MS)))
+    html = html.replace("__MPU_ADDR__", f"0x{MPU_ADDR:02X}")
     return Response(html, mimetype="text/html")
 
 
