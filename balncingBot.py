@@ -27,16 +27,20 @@ INTER_FRAME_DELAY_S = 0.004
 
 MOTOR1_ADDR = 0x01
 MOTOR2_ADDR = 0x02
-MOTOR2_INVERT = True   # un motor invertido (como pediste antes)
+MOTOR2_INVERT = True   # un motor invertido
+
+# SOLO comandos F3 (enable) y F6 (velocidad)
+DEFAULT_ACC_BYTE = 50  # byte "acc" dentro de F6 (0..255) - forma parte de F6
 # =====================================================
 
-# ===================== CONTROL LOOP =====================
+# ===================== LOOP CONFIG =====================
 IMU_HZ = 200
 CTRL_HZ = 100
 SETPOINT_DEG = 0.0
 
-DEFAULT_ACC_BYTE = 50     # byte "acc" dentro de F6 (0..255) - forma parte del comando velocidad
-# ========================================================
+# Reafirmar enable periódicamente para evitar perder el único pulso
+F3_REASSERT_S = 0.5  # 2 Hz
+# =======================================================
 
 app = Flask(__name__)
 stop_evt = threading.Event()
@@ -49,7 +53,6 @@ def clamp(x: float, lo: float, hi: float) -> float:
     return lo if x < lo else hi if x > hi else x
 
 def lpf_alpha(dt: float, tau: float) -> float:
-    # IIR 1er orden: y += a*(x-y), a = dt/(tau+dt), tau<=0 => sin filtro
     if tau <= 0.0:
         return 1.0
     return dt / (tau + dt)
@@ -62,21 +65,22 @@ def build_frame(addr: int, cmd: int, payload: bytes) -> bytes:
     base = bytes([0xFA, addr & 0xFF, cmd & 0xFF]) + payload
     return base + bytes([crc_sum8(base)])
 
-def send_frame(ser: serial.Serial, addr: int, cmd: int, payload: bytes) -> None:
+def send_frame(ser: serial.Serial, addr: int, cmd: int, payload: bytes) -> bytes:
     fr = build_frame(addr, cmd, payload)
     ser.write(fr)
     ser.flush()
     time.sleep(INTER_FRAME_DELAY_S)
+    return fr
 
-def cmd_enable(ser: serial.Serial, addr: int, enable: bool) -> None:
+def cmd_enable(ser: serial.Serial, addr: int, enable: bool) -> bytes:
     # F3: [0x01] enable, [0x00] disable
-    send_frame(ser, addr, 0xF3, bytes([0x01 if enable else 0x00]))
+    return send_frame(ser, addr, 0xF3, bytes([0x01 if enable else 0x00]))
 
-def cmd_run_rpm(ser: serial.Serial, addr: int, rpm: int, acc_byte: int) -> None:
+def cmd_run_rpm(ser: serial.Serial, addr: int, rpm: int, acc_byte: int) -> bytes:
     # F6: [rpm_hi rpm_lo acc]
-    rpm16 = rpm & 0xFFFF
+    rpm16 = rpm & 0xFFFF  # int16 firmado en 2's complement
     payload = bytes([(rpm16 >> 8) & 0xFF, rpm16 & 0xFF, acc_byte & 0xFF])
-    send_frame(ser, addr, 0xF6, payload)
+    return send_frame(ser, addr, 0xF6, payload)
 
 # -------------------- Shared params/state --------------------
 @dataclass
@@ -91,7 +95,7 @@ class Tunables:
     ki: float = 0.0
     kd: float = 0.5
 
-    # límites
+    # límite
     max_rpm: int = 80
 
     # enable
@@ -102,7 +106,7 @@ tun_lock = threading.Lock()
 
 @dataclass
 class Runtime:
-    # señales
+    # señales filtradas
     az_g: float = 0.0
     gz_dps: float = 0.0
 
@@ -110,19 +114,20 @@ class Runtime:
     angle_acc_deg: float = 0.0     # acos(Az_f) (0..180)
     angle_fused_deg: float = 0.0   # fusionado (antes de offset)
     angle_zero_offset_deg: float = 0.0
-    angle_out_deg: float = 0.0     # (fused - offset), el que entra al PID
+    angle_out_deg: float = 0.0     # (fused - offset), entra al PID
 
-    # PID interno
+    # PID
     err_deg: float = 0.0
     p_term: float = 0.0
     i_term: float = 0.0
     d_term: float = 0.0
     u_rpm: float = 0.0
 
-    # salida motores (lo mandado)
+    # salida
     rpm_m1: int = 0
     rpm_m2: int = 0
 
+    # estados
     ok_imu: bool = False
     err_imu: str = ""
     ok_rs485: bool = False
@@ -131,10 +136,19 @@ class Runtime:
     ts: float = 0.0
     dt_ctrl: float = 0.0
 
+    # telemetría TX (para comprobar enable)
+    last_f3_ts: float = 0.0
+    last_f3_enable: bool = False
+    last_f3_hex: str = ""
+
+    last_f6_ts: float = 0.0
+    last_f6_hex_m1: str = ""
+    last_f6_hex_m2: str = ""
+
 rt = Runtime()
 rt_lock = threading.Lock()
 
-# “botón de cero”
+# Botón “hacer cero”
 set_zero_evt = threading.Event()
 
 # -------------------- IMU thread (Z only) --------------------
@@ -189,22 +203,19 @@ def imu_thread():
             az_f = az_f + a_acc * (az - az_f)
             gz_f = gz_f + a_gyr * (gz - gz_f)
 
-            # ángulo de accel (0..180)
             az_c = clamp(az_f, -1.0, 1.0)
             angle_acc = math.degrees(math.acos(az_c))
 
-            # complementario (estado)
             angle_fused = alpha * (angle_fused + gz_f * dt) + (1.0 - alpha) * angle_acc
 
-            # aplicar “hacer cero”
             if set_zero_evt.is_set():
                 set_zero_evt.clear()
                 with rt_lock:
                     rt.angle_zero_offset_deg = float(angle_fused)
 
             with rt_lock:
-                rt.az_g = float(az_f)     # ya filtrado
-                rt.gz_dps = float(gz_f)   # ya filtrado
+                rt.az_g = float(az_f)
+                rt.gz_dps = float(gz_f)
                 rt.angle_acc_deg = float(angle_acc)
                 rt.angle_fused_deg = float(angle_fused)
                 rt.ok_imu = True
@@ -216,7 +227,6 @@ def imu_thread():
                 rt.err_imu = repr(e)
             time.sleep(0.05)
 
-        # pacing
         loop_dt = time.time() - t0
         sleep_s = period - loop_dt
         if sleep_s > 0:
@@ -229,7 +239,6 @@ def imu_thread():
 
 # -------------------- Control + RS485 thread --------------------
 def control_rs485_thread():
-    # RS485 open
     try:
         ser = serial.Serial(RS485_PORT, RS485_BAUD, timeout=RS485_TIMEOUT_S)
     except Exception as e:
@@ -238,13 +247,13 @@ def control_rs485_thread():
             rt.err_rs485 = f"Serial open failed: {repr(e)}"
         return
 
-    # PID states
     i_term = 0.0
     prev_err = 0.0
     t_prev = time.time()
     period = 1.0 / float(CTRL_HZ)
 
     last_enabled = None
+    last_f3_reassert = 0.0
 
     try:
         while not stop_evt.is_set():
@@ -261,7 +270,6 @@ def control_rs485_thread():
                 kd = float(tun.kd)
                 max_rpm = int(tun.max_rpm)
 
-            # leer ángulo fusionado actual
             with rt_lock:
                 fused = float(rt.angle_fused_deg)
                 zoff = float(rt.angle_zero_offset_deg)
@@ -270,52 +278,64 @@ def control_rs485_thread():
             angle_out = fused - zoff
             err = SETPOINT_DEG - angle_out
 
-            # PID (si IMU no OK o no enabled -> fuerza 0 y limpia I)
+            # PID
             if (not enabled) or (not ok_imu):
                 i_term = 0.0
                 prev_err = err
                 u = 0.0
+                p = 0.0
+                d = 0.0
             else:
-                # P
                 p = kp * err
-
-                # I (antiwindup simple: clamp por max_rpm)
                 i_term += ki * err * dt
                 i_term = clamp(i_term, -float(max_rpm), float(max_rpm))
-
-                # D (derivada del error)
                 derr = (err - prev_err) / dt
                 d = kd * derr
                 prev_err = err
-
-                u = p + i_term + d
-                u = clamp(u, -float(max_rpm), float(max_rpm))
+                u = clamp(p + i_term + d, -float(max_rpm), float(max_rpm))
 
             rpm_cmd = int(round(u))
             rpm_m1 = rpm_cmd
             rpm_m2 = -rpm_cmd if MOTOR2_INVERT else rpm_cmd
 
+            now = time.time()
+
             # RS485: SOLO F3 y F6
             try:
-                if last_enabled is None or enabled != last_enabled:
-                    cmd_enable(ser, MOTOR1_ADDR, enabled)
-                    cmd_enable(ser, MOTOR2_ADDR, enabled)
-                    last_enabled = enabled
+                need_f3 = (last_enabled is None) or (enabled != last_enabled)
+                if enabled and (now - last_f3_reassert) >= F3_REASSERT_S:
+                    need_f3 = True
 
-                # Mandar velocidad SIEMPRE a CTRL_HZ cuando enabled, para evitar “se queda parado”
-                # Si no enabled, mandar 0rpm (F6) y ya.
+                if need_f3:
+                    fr1 = cmd_enable(ser, MOTOR1_ADDR, enabled)
+                    fr2 = cmd_enable(ser, MOTOR2_ADDR, enabled)
+                    last_enabled = enabled
+                    last_f3_reassert = now
+
+                    f3hex = fr1.hex(" ") + " | " + fr2.hex(" ")
+                    print(f"TX F3 enable={enabled}: {f3hex}")
+
+                    with rt_lock:
+                        rt.last_f3_ts = now
+                        rt.last_f3_enable = bool(enabled)
+                        rt.last_f3_hex = f3hex
+
                 if enabled and ok_imu:
-                    cmd_run_rpm(ser, MOTOR1_ADDR, rpm_m1, DEFAULT_ACC_BYTE)
-                    cmd_run_rpm(ser, MOTOR2_ADDR, rpm_m2, DEFAULT_ACC_BYTE)
+                    fr1 = cmd_run_rpm(ser, MOTOR1_ADDR, rpm_m1, DEFAULT_ACC_BYTE)
+                    fr2 = cmd_run_rpm(ser, MOTOR2_ADDR, rpm_m2, DEFAULT_ACC_BYTE)
                 else:
-                    cmd_run_rpm(ser, MOTOR1_ADDR, 0, 0)
-                    cmd_run_rpm(ser, MOTOR2_ADDR, 0, 0)
+                    fr1 = cmd_run_rpm(ser, MOTOR1_ADDR, 0, 0)
+                    fr2 = cmd_run_rpm(ser, MOTOR2_ADDR, 0, 0)
 
                 with rt_lock:
                     rt.ok_rs485 = True
                     rt.err_rs485 = ""
                     rt.rpm_m1 = int(rpm_m1 if (enabled and ok_imu) else 0)
                     rt.rpm_m2 = int(rpm_m2 if (enabled and ok_imu) else 0)
+
+                    rt.last_f6_ts = now
+                    rt.last_f6_hex_m1 = fr1.hex(" ")
+                    rt.last_f6_hex_m2 = fr2.hex(" ")
 
             except Exception as e:
                 with rt_lock:
@@ -327,12 +347,11 @@ def control_rs485_thread():
                 rt.dt_ctrl = dt
                 rt.angle_out_deg = float(angle_out)
                 rt.err_deg = float(err)
-                rt.p_term = float(kp * err)
+                rt.p_term = float(p)
                 rt.i_term = float(i_term)
-                rt.d_term = float(kd * ((err - prev_err) / dt) if dt > 0 else 0.0)
+                rt.d_term = float(d)
                 rt.u_rpm = float(u)
 
-            # pacing
             loop_dt = time.time() - t0
             sleep_s = period - loop_dt
             if sleep_s > 0:
@@ -397,6 +416,7 @@ def index():
     input[type=range] { width: 420px; }
     .k { width: 180px; color:#555; }
     button { padding: 6px 10px; }
+    .small { color:#666; font-size: 12px; }
   </style>
 </head>
 <body>
@@ -411,6 +431,15 @@ def index():
     <div class="row">
       <div class="k">Ángulo (deg)</div><div id="ang" class="mono">-</div>
       <div class="k">RPM cmd</div><div id="rpm" class="mono">-</div>
+    </div>
+    <div class="row">
+      <div class="k">Último F3</div><div id="f3" class="mono">-</div>
+    </div>
+    <div class="row">
+      <div class="k">F6 M1</div><div id="f6m1" class="mono small">-</div>
+    </div>
+    <div class="row">
+      <div class="k">F6 M2</div><div id="f6m2" class="mono small">-</div>
     </div>
     <div class="row">
       <div class="k">Err IMU</div><div id="eimu" class="mono">-</div>
@@ -505,11 +534,9 @@ function bindRange(id, outId, key, castFloat=true){
 }
 
 bindRange("maxrpm","maxrpmv","max_rpm", false);
-
 bindRange("tauacc","tauaccv","tau_acc", true);
 bindRange("taugyr","taugyrv","tau_gyro", true);
 bindRange("alpha","alphav","alpha_comp", true);
-
 bindRange("kp","kpv","kp", true);
 bindRange("ki","kiv","ki", true);
 bindRange("kd","kdv","kd", true);
@@ -529,10 +556,8 @@ async function tick(){
     const rt = d.rt;
     const tun = d.tun;
 
-    // sync enable checkbox if needed
     document.getElementById("en").checked = !!tun.enabled;
 
-    // status
     const imuok = document.getElementById("imuok");
     imuok.textContent = rt.ok_imu ? "OK" : "ERROR";
     imuok.className = "mono " + (rt.ok_imu ? "ok" : "bad");
@@ -544,6 +569,10 @@ async function tick(){
     document.getElementById("dt").textContent = fmt(rt.dt_ctrl, 4);
     document.getElementById("ang").textContent = fmt(rt.angle_out_deg, 3);
     document.getElementById("rpm").textContent = String(Math.round(rt.u_rpm));
+
+    document.getElementById("f3").textContent = rt.last_f3_hex || "-";
+    document.getElementById("f6m1").textContent = rt.last_f6_hex_m1 || "-";
+    document.getElementById("f6m2").textContent = rt.last_f6_hex_m2 || "-";
 
     document.getElementById("eimu").textContent = rt.err_imu || "-";
     document.getElementById("ebus").textContent = rt.err_rs485 || "-";
@@ -567,7 +596,7 @@ setInterval(tick, 200);
 # -------------------- Shutdown --------------------
 def shutdown_handler(signum=None, frame=None):
     stop_evt.set()
-    time.sleep(0.15)
+    time.sleep(0.2)
     sys.exit(0)
 
 def main():
