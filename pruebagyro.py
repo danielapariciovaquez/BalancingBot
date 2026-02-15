@@ -3,22 +3,23 @@ import time
 import threading
 import signal
 import sys
+import math
 from dataclasses import dataclass, asdict
 
 from smbus2 import SMBus
-from flask import Flask, jsonify, Response
+from flask import Flask, jsonify, Response, request
 
 # ===================== CONFIG =====================
 I2C_BUS = 1
 MPU_ADDR = 0x68
 
-READ_HZ = 100          # lectura IMU en backend
-WEB_POLL_MS = 200      # refresco del navegador (ms)
+READ_HZ = 200          # lectura IMU backend
+WEB_POLL_MS = 100      # refresco web (ms)
 
 HTTP_HOST = "0.0.0.0"
 HTTP_PORT = 5000
 
-# Escalas por defecto (MPU6050 reset):
+# Escalas por defecto (reset):
 # accel FS=±2g, gyro FS=±250°/s
 ACCEL_SCALE = 16384.0  # LSB/g
 GYRO_SCALE = 131.0     # LSB/(°/s)
@@ -30,89 +31,177 @@ ACCEL_XOUT_H = 0x3B
 
 app = Flask(__name__)
 
+def _to_int16(v: int) -> int:
+    return v - 0x10000 if (v & 0x8000) else v
+
+def lpf_alpha(dt: float, tau: float) -> float:
+    # IIR 1er orden: y += a*(x-y), a = dt/(tau+dt). tau<=0 => sin filtro.
+    if tau <= 0.0:
+        return 1.0
+    return dt / (tau + dt)
+
 @dataclass
-class ImuSample:
+class Params:
+    tau_acc: float = 0.10     # s, LPF sobre (Ax,Ay,Az)
+    tau_gyro: float = 0.02    # s, LPF sobre Gy
+    alpha_comp: float = 0.98  # complementario
+    invert_gyro: bool = False # invierte signo de Gy si está montado al revés
+    invert_angle: bool = False# invierte signo del ángulo final (pitch) si conviene
+
+params = Params()
+params_lock = threading.Lock()
+
+@dataclass
+class PitchState:
     ts: float = 0.0
-    ax_g: float = 0.0
-    ay_g: float = 0.0
-    az_g: float = 0.0
-    gx_dps: float = 0.0
-    gy_dps: float = 0.0
-    gz_dps: float = 0.0
+    dt: float = 0.0
+
+    ax_g_raw: float = 0.0
+    ay_g_raw: float = 0.0
+    az_g_raw: float = 0.0
+    gy_dps_raw: float = 0.0
+
+    ax_g_f: float = 0.0
+    ay_g_f: float = 0.0
+    az_g_f: float = 0.0
+    gy_dps_f: float = 0.0
+
+    pitch_acc_deg: float = 0.0
+    pitch_gyro_deg: float = 0.0
+    pitch_fused_deg: float = 0.0
+
     ok: bool = False
     err: str = ""
 
-sample = ImuSample()
-lock = threading.Lock()
+state = PitchState()
+state_lock = threading.Lock()
 stop_evt = threading.Event()
-
-
-def _to_int16(v: int) -> int:
-    # v en 0..65535
-    if v & 0x8000:
-        return v - 0x10000
-    return v
+reset_evt = threading.Event()
 
 
 def imu_thread():
-    global sample
-    period = 1.0 / float(READ_HZ)
+    global state
 
+    period = 1.0 / float(READ_HZ)
     try:
         bus = SMBus(I2C_BUS)
     except Exception as e:
-        with lock:
-            sample.ok = False
-            sample.err = f"SMBus open failed: {repr(e)}"
+        with state_lock:
+            state.ok = False
+            state.err = f"SMBus open failed: {repr(e)}"
         return
 
     try:
-        # Wake up MPU6050
-        bus.write_byte_data(MPU_ADDR, PWR_MGMT_1, 0x00)
+        bus.write_byte_data(MPU_ADDR, PWR_MGMT_1, 0x00)  # wake
     except Exception as e:
-        with lock:
-            sample.ok = False
-            sample.err = f"MPU init failed: {repr(e)}"
+        with state_lock:
+            state.ok = False
+            state.err = f"MPU init failed: {repr(e)}"
         try:
             bus.close()
         except Exception:
             pass
         return
 
+    # Memorias filtro
+    ax_f = ay_f = az_f = 0.0
+    gy_f = 0.0
+    pitch_gyro = 0.0
+    pitch_fused = 0.0
+
+    t_prev = time.time()
+
     while not stop_evt.is_set():
         t0 = time.time()
+        dt = t0 - t_prev
+        if dt <= 0.0:
+            dt = 1.0 / READ_HZ
+        t_prev = t0
+
+        if reset_evt.is_set():
+            reset_evt.clear()
+            pitch_gyro = 0.0
+            pitch_fused = 0.0
+
         try:
-            # Leer 14 bytes: accel(6) temp(2) gyro(6)
             data = bus.read_i2c_block_data(MPU_ADDR, ACCEL_XOUT_H, 14)
 
             ax = _to_int16((data[0] << 8) | data[1]) / ACCEL_SCALE
             ay = _to_int16((data[2] << 8) | data[3]) / ACCEL_SCALE
             az = _to_int16((data[4] << 8) | data[5]) / ACCEL_SCALE
 
-            gx = _to_int16((data[8] << 8) | data[9]) / GYRO_SCALE
+            # gyro Y (bytes 10..11)
             gy = _to_int16((data[10] << 8) | data[11]) / GYRO_SCALE
-            gz = _to_int16((data[12] << 8) | data[13]) / GYRO_SCALE
 
-            with lock:
-                sample.ts = t0
-                sample.ax_g = float(ax)
-                sample.ay_g = float(ay)
-                sample.az_g = float(az)
-                sample.gx_dps = float(gx)
-                sample.gy_dps = float(gy)
-                sample.gz_dps = float(gz)
-                sample.ok = True
-                sample.err = ""
+            with params_lock:
+                tau_acc = float(params.tau_acc)
+                tau_gyro = float(params.tau_gyro)
+                alpha = float(params.alpha_comp)
+                inv_g = bool(params.invert_gyro)
+                inv_a = bool(params.invert_angle)
+
+            if inv_g:
+                gy = -gy
+
+            a_acc = lpf_alpha(dt, tau_acc)
+            a_gyr = lpf_alpha(dt, tau_gyro)
+
+            ax_f = ax_f + a_acc * (ax - ax_f)
+            ay_f = ay_f + a_acc * (ay - ay_f)
+            az_f = az_f + a_acc * (az - az_f)
+            gy_f = gy_f + a_gyr * (gy - gy_f)
+
+            # PITCH desde accel: atan2(-Ax, sqrt(Ay^2 + Az^2)) (deg)
+            denom = math.sqrt(ay_f * ay_f + az_f * az_f)
+            pitch_acc = math.degrees(math.atan2(-ax_f, denom))
+
+            # Integración gyro (Gy)
+            pitch_gyro += gy_f * dt
+
+            # Complementario (estado)
+            pitch_fused = alpha * (pitch_fused + gy_f * dt) + (1.0 - alpha) * pitch_acc
+
+            if inv_a:
+                pitch_acc_out = -pitch_acc
+                pitch_gyro_out = -pitch_gyro
+                pitch_fused_out = -pitch_fused
+            else:
+                pitch_acc_out = pitch_acc
+                pitch_gyro_out = pitch_gyro
+                pitch_fused_out = pitch_fused
+
+            with state_lock:
+                state.ts = t0
+                state.dt = dt
+
+                state.ax_g_raw = float(ax)
+                state.ay_g_raw = float(ay)
+                state.az_g_raw = float(az)
+                state.gy_dps_raw = float(gy)
+
+                state.ax_g_f = float(ax_f)
+                state.ay_g_f = float(ay_f)
+                state.az_g_f = float(az_f)
+                state.gy_dps_f = float(gy_f)
+
+                state.pitch_acc_deg = float(pitch_acc_out)
+                state.pitch_gyro_deg = float(pitch_gyro_out)
+                state.pitch_fused_deg = float(pitch_fused_out)
+
+                state.ok = True
+                state.err = ""
 
         except Exception as e:
-            with lock:
-                sample.ts = t0
-                sample.ok = False
-                sample.err = repr(e)
-            time.sleep(0.05)  # evita bucle loco si I2C cae
+            with state_lock:
+                state.ts = t0
+                state.dt = dt
+                state.ok = False
+                state.err = repr(e)
+            time.sleep(0.05)
 
-        dt = time.time() - t0
-        sleep_s = period - dt
+        # pacing
+        loop_dt = time.time() - t0
+        sleep_s = period - loop_dt
         if sleep_s > 0:
             time.sleep(sleep_s)
 
@@ -122,10 +211,36 @@ def imu_thread():
         pass
 
 
-@app.get("/api/imu")
-def api_imu():
-    with lock:
-        return jsonify(asdict(sample))
+@app.get("/api/pitch")
+def api_pitch():
+    with state_lock:
+        s = asdict(state)
+    with params_lock:
+        p = asdict(params)
+    return jsonify({"state": s, "params": p})
+
+
+@app.post("/api/params")
+def api_params():
+    data = request.get_json(force=True, silent=True) or {}
+    with params_lock:
+        if "tau_acc" in data:
+            params.tau_acc = float(data["tau_acc"])
+        if "tau_gyro" in data:
+            params.tau_gyro = float(data["tau_gyro"])
+        if "alpha_comp" in data:
+            params.alpha_comp = float(data["alpha_comp"])
+        if "invert_gyro" in data:
+            params.invert_gyro = bool(data["invert_gyro"])
+        if "invert_angle" in data:
+            params.invert_angle = bool(data["invert_angle"])
+    return jsonify({"ok": True})
+
+
+@app.post("/api/reset")
+def api_reset():
+    reset_evt.set()
+    return jsonify({"ok": True})
 
 
 @app.get("/")
@@ -135,84 +250,160 @@ def index():
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>MPU6050 - IMU Monitor</title>
+  <title>MPU6050 — Pitch (deg) + filtrado</title>
   <style>
     body {{ font-family: system-ui, sans-serif; margin: 20px; }}
-    .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 16px; max-width: 900px; }}
+    .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 16px; max-width: 980px; }}
     .card {{ border: 1px solid #ddd; border-radius: 10px; padding: 14px; }}
     .title {{ font-weight: 700; margin-bottom: 10px; }}
-    table {{ width: 100%; border-collapse: collapse; }}
-    td {{ padding: 6px 0; }}
-    td.k {{ width: 44px; color: #555; }}
+    .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }}
     .ok {{ color: #0a7; font-weight: 700; }}
     .bad {{ color: #c22; font-weight: 700; }}
-    .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }}
-    .small {{ color: #666; font-size: 12px; }}
+    .row {{ display:flex; gap:12px; align-items:center; margin: 10px 0; flex-wrap: wrap; }}
+    input[type=range] {{ width: 320px; }}
+    .small {{ color:#666; font-size: 12px; }}
+    table {{ width:100%; border-collapse: collapse; }}
+    td {{ padding: 6px 0; }}
+    td.k {{ width: 170px; color:#555; }}
   </style>
 </head>
 <body>
-  <h2>MPU6050 (GY-521) — Acelerómetro y Giroscopio</h2>
+  <h2>MPU6050 (GY-521) — Pitch (deg) + filtrado</h2>
   <div class="small">
-    Backend: {READ_HZ} Hz · Web: {int(WEB_POLL_MS)} ms · I2C addr: 0x{MPU_ADDR:02X}
+    Backend: {READ_HZ} Hz · Web: {int(WEB_POLL_MS)} ms · I2C addr: 0x{MPU_ADDR:02X}<br>
+    Pitch_acc = atan2(-Ax, sqrt(Ay²+Az²)) · Gyro usado: Gy
   </div>
 
   <div style="margin:10px 0">
     Estado: <span id="status" class="mono">...</span>
     &nbsp;|&nbsp; ts: <span id="ts" class="mono">...</span>
+    &nbsp;|&nbsp; dt: <span id="dt" class="mono">...</span>
   </div>
 
   <div class="grid">
     <div class="card">
-      <div class="title">Aceleración (g)</div>
+      <div class="title">Señales (filtradas)</div>
       <table>
-        <tr><td class="k">Ax</td><td class="mono" id="ax">-</td></tr>
-        <tr><td class="k">Ay</td><td class="mono" id="ay">-</td></tr>
-        <tr><td class="k">Az</td><td class="mono" id="az">-</td></tr>
+        <tr><td class="k">Ax (g)</td><td class="mono" id="ax">-</td></tr>
+        <tr><td class="k">Ay (g)</td><td class="mono" id="ay">-</td></tr>
+        <tr><td class="k">Az (g)</td><td class="mono" id="az">-</td></tr>
+        <tr><td class="k">Gy (°/s)</td><td class="mono" id="gy">-</td></tr>
       </table>
     </div>
 
     <div class="card">
-      <div class="title">Giroscopio (°/s)</div>
+      <div class="title">Pitch (deg)</div>
       <table>
-        <tr><td class="k">Gx</td><td class="mono" id="gx">-</td></tr>
-        <tr><td class="k">Gy</td><td class="mono" id="gy">-</td></tr>
-        <tr><td class="k">Gz</td><td class="mono" id="gz">-</td></tr>
+        <tr><td class="k">Pitch acc</td><td class="mono" id="pacc">-</td></tr>
+        <tr><td class="k">Pitch gyro (int)</td><td class="mono" id="pgyr">-</td></tr>
+        <tr><td class="k">Pitch fused (comp)</td><td class="mono" id="pfus">-</td></tr>
       </table>
+      <div class="row">
+        <button id="btnReset">Reset</button>
+      </div>
+      <div class="small">
+        Si el signo va al revés, usa “Invert gyro” o “Invert angle”.
+      </div>
     </div>
 
     <div class="card" style="grid-column: 1 / -1;">
-      <div class="title">Error (si aplica)</div>
-      <div class="mono" id="err">-</div>
+      <div class="title">Ajustes</div>
+
+      <div class="row">
+        <div style="width:170px">τ accel (s)</div>
+        <input id="tauAcc" type="range" min="0" max="1.0" step="0.005" value="0.10">
+        <div class="mono" id="tauAccV">0.10</div>
+      </div>
+
+      <div class="row">
+        <div style="width:170px">τ gyro (s)</div>
+        <input id="tauGyr" type="range" min="0" max="0.5" step="0.002" value="0.02">
+        <div class="mono" id="tauGyrV">0.02</div>
+      </div>
+
+      <div class="row">
+        <div style="width:170px">alpha complement.</div>
+        <input id="alpha" type="range" min="0" max="1.0" step="0.001" value="0.98">
+        <div class="mono" id="alphaV">0.98</div>
+      </div>
+
+      <div class="row">
+        <label><input id="invGyro" type="checkbox"> Invert gyro (Gy)</label>
+        <label><input id="invAng" type="checkbox"> Invert angle (pitch)</label>
+      </div>
+
+      <div class="small mono" id="err">-</div>
     </div>
   </div>
 
 <script>
-const fmt = (v) => (typeof v === "number" ? v.toFixed(4) : String(v));
+const POLL_MS = {int(WEB_POLL_MS)};
+const fmt = (v, n=4) => (typeof v === "number" ? v.toFixed(n) : String(v));
 
-async function tick() {{
+async function postJSON(url, obj){{
+  await fetch(url, {{
+    method: "POST",
+    headers: {{"Content-Type":"application/json"}},
+    body: JSON.stringify(obj)
+  }});
+}}
+
+function bindSlider(id, outId, key){{
+  const s = document.getElementById(id);
+  const o = document.getElementById(outId);
+  const send = async ()=> {{
+    const v = Number(s.value);
+    o.textContent = fmt(v, 3);
+    const payload = {{}};
+    payload[key] = v;
+    await postJSON("/api/params", payload);
+  }};
+  s.addEventListener("input", ()=>{{ o.textContent = fmt(Number(s.value), 3); }});
+  s.addEventListener("change", send);
+}}
+
+bindSlider("tauAcc","tauAccV","tau_acc");
+bindSlider("tauGyr","tauGyrV","tau_gyro");
+bindSlider("alpha","alphaV","alpha_comp");
+
+document.getElementById("invGyro").addEventListener("change", async (e)=>{
+  await postJSON("/api/params", {{invert_gyro: e.target.checked}});
+});
+document.getElementById("invAng").addEventListener("change", async (e)=>{
+  await postJSON("/api/params", {{invert_angle: e.target.checked}});
+});
+
+document.getElementById("btnReset").addEventListener("click", async ()=>{
+  await fetch("/api/reset", {{method:"POST"}});
+});
+
+async function tick(){{
   try {{
-    const r = await fetch("/api/imu", {{cache:"no-store"}});
+    const r = await fetch("/api/pitch", {{cache:"no-store"}});
     const d = await r.json();
+    const s = d.state;
 
-    document.getElementById("ax").textContent = fmt(d.ax_g);
-    document.getElementById("ay").textContent = fmt(d.ay_g);
-    document.getElementById("az").textContent = fmt(d.az_g);
+    document.getElementById("ax").textContent = fmt(s.ax_g_f);
+    document.getElementById("ay").textContent = fmt(s.ay_g_f);
+    document.getElementById("az").textContent = fmt(s.az_g_f);
+    document.getElementById("gy").textContent = fmt(s.gy_dps_f);
 
-    document.getElementById("gx").textContent = fmt(d.gx_dps);
-    document.getElementById("gy").textContent = fmt(d.gy_dps);
-    document.getElementById("gz").textContent = fmt(d.gz_dps);
+    document.getElementById("pacc").textContent = fmt(s.pitch_acc_deg, 3);
+    document.getElementById("pgyr").textContent = fmt(s.pitch_gyro_deg, 3);
+    document.getElementById("pfus").textContent = fmt(s.pitch_fused_deg, 3);
 
-    document.getElementById("ts").textContent = fmt(d.ts);
+    document.getElementById("ts").textContent = fmt(s.ts, 3);
+    document.getElementById("dt").textContent = fmt(s.dt, 4);
 
     const st = document.getElementById("status");
-    if (d.ok) {{
+    if (s.ok) {{
       st.textContent = "OK";
       st.className = "mono ok";
       document.getElementById("err").textContent = "-";
     }} else {{
       st.textContent = "ERROR";
       st.className = "mono bad";
-      document.getElementById("err").textContent = d.err || "-";
+      document.getElementById("err").textContent = s.err || "-";
     }}
   }} catch (e) {{
     const st = document.getElementById("status");
@@ -223,7 +414,7 @@ async function tick() {{
 }}
 
 tick();
-setInterval(tick, {int(WEB_POLL_MS)});
+setInterval(tick, POLL_MS);
 </script>
 </body>
 </html>
@@ -244,7 +435,6 @@ def main():
     t = threading.Thread(target=imu_thread, daemon=True)
     t.start()
 
-    # Flask dev server suficiente en LAN local
     app.run(host=HTTP_HOST, port=HTTP_PORT, debug=False, use_reloader=False)
 
 
