@@ -19,11 +19,9 @@ WEB_POLL_MS = 100
 HTTP_HOST = "0.0.0.0"
 HTTP_PORT = 5000
 
-# Escalas por defecto del MPU6050 tras reset:
-ACCEL_SCALE = 16384.0  # LSB/g   (±2g)
-GYRO_SCALE = 131.0     # LSB/(°/s) (±250°/s)
+ACCEL_SCALE = 16384.0  # LSB/g
+GYRO_SCALE = 131.0     # LSB/(°/s)
 
-# Registros MPU6050
 PWR_MGMT_1 = 0x6B
 ACCEL_XOUT_H = 0x3B
 # ==================================================
@@ -37,18 +35,17 @@ def _to_int16(v: int) -> int:
     return v - 0x10000 if (v & 0x8000) else v
 
 def lpf_alpha(dt: float, tau: float) -> float:
-    # IIR 1er orden: y += a*(x-y), a = dt/(tau+dt). tau<=0 => sin filtro.
     if tau <= 0.0:
         return 1.0
     return dt / (tau + dt)
 
 @dataclass
 class Params:
-    tau_acc: float = 0.10      # s, LPF sobre Az
-    tau_gyro: float = 0.02     # s, LPF sobre Gz
-    alpha_comp: float = 0.98   # complementario (0..1)
-    invert_gyro: bool = False  # invierte signo de Gz
-    invert_angle: bool = False # invierte signo de ángulos mostrados
+    tau_acc: float = 0.10
+    tau_gyro: float = 0.02
+    alpha_comp: float = 0.98
+    invert_gyro: bool = False
+    invert_angle: bool = False
 
 params = Params()
 params_lock = threading.Lock()
@@ -68,6 +65,8 @@ class ZState:
     angle_gyro_deg: float = 0.0
     angle_fused_deg: float = 0.0
 
+    zero_offset_deg: float = 0.0  # offset aplicado a las salidas
+
     ok: bool = False
     err: str = ""
 
@@ -76,8 +75,14 @@ state_lock = threading.Lock()
 stop_evt = threading.Event()
 reset_evt = threading.Event()
 
+# offset “set 0°”
+zero_lock = threading.Lock()
+zero_offset_deg = 0.0
+set_zero_evt = threading.Event()
+
 
 def imu_thread():
+    global zero_offset_deg
     period = 1.0 / float(READ_HZ)
 
     try:
@@ -89,7 +94,7 @@ def imu_thread():
         return
 
     try:
-        bus.write_byte_data(MPU_ADDR, PWR_MGMT_1, 0x00)  # wake
+        bus.write_byte_data(MPU_ADDR, PWR_MGMT_1, 0x00)
     except Exception as e:
         with state_lock:
             state.ok = False
@@ -120,7 +125,6 @@ def imu_thread():
             angle_fused = 0.0
 
         try:
-            # 14 bytes: accel(6) temp(2) gyro(6)
             data = bus.read_i2c_block_data(MPU_ADDR, ACCEL_XOUT_H, 14)
 
             az = _to_int16((data[4] << 8) | data[5]) / ACCEL_SCALE
@@ -142,24 +146,31 @@ def imu_thread():
             az_f = az_f + a_acc * (az - az_f)
             gz_f = gz_f + a_gyr * (gz - gz_f)
 
-            # Ángulo desde Z: acos(Az) en grados (0..180)
             az_c = clamp(az_f, -1.0, 1.0)
-            angle_acc = math.degrees(math.acos(az_c))
+            angle_acc = math.degrees(math.acos(az_c))  # 0..180
 
-            # Integración gyro
             angle_gyro += gz_f * dt
 
-            # Complementario sobre el estado (fused)
             angle_fused = alpha * (angle_fused + gz_f * dt) + (1.0 - alpha) * angle_acc
 
+            # Si piden “set 0°”, usamos el valor actual fused como referencia
+            if set_zero_evt.is_set():
+                set_zero_evt.clear()
+                with zero_lock:
+                    zero_offset_deg = angle_fused
+
+            with zero_lock:
+                zoff = float(zero_offset_deg)
+
+            # aplicar offset para que “aquí” sea 0°
+            angle_acc_out = angle_acc - zoff
+            angle_gyro_out = angle_gyro - zoff
+            angle_fused_out = angle_fused - zoff
+
             if inv_a:
-                angle_acc_out = -angle_acc
-                angle_gyro_out = -angle_gyro
-                angle_fused_out = -angle_fused
-            else:
-                angle_acc_out = angle_acc
-                angle_gyro_out = angle_gyro
-                angle_fused_out = angle_fused
+                angle_acc_out = -angle_acc_out
+                angle_gyro_out = -angle_gyro_out
+                angle_fused_out = -angle_fused_out
 
             with state_lock:
                 state.ts = t0
@@ -174,6 +185,8 @@ def imu_thread():
                 state.angle_acc_deg = float(angle_acc_out)
                 state.angle_gyro_deg = float(angle_gyro_out)
                 state.angle_fused_deg = float(angle_fused_out)
+
+                state.zero_offset_deg = float(zoff)
 
                 state.ok = True
                 state.err = ""
@@ -229,6 +242,12 @@ def api_reset():
     return jsonify({"ok": True})
 
 
+@app.post("/api/zero_here")
+def api_zero_here():
+    set_zero_evt.set()
+    return jsonify({"ok": True})
+
+
 @app.get("/")
 def index():
     html = """<!doctype html>
@@ -250,7 +269,7 @@ def index():
     .small { color:#666; font-size: 12px; }
     table { width:100%; border-collapse: collapse; }
     td { padding: 6px 0; }
-    td.k { width: 200px; color:#555; }
+    td.k { width: 230px; color:#555; }
   </style>
 </head>
 <body>
@@ -275,17 +294,19 @@ def index():
     </div>
 
     <div class="card">
-      <div class="title">Ángulos (deg)</div>
+      <div class="title">Ángulos (deg) — relativos al “0°”</div>
       <table>
         <tr><td class="k">Angle acc = acos(Az)</td><td class="mono" id="aacc">-</td></tr>
         <tr><td class="k">Angle gyro (integrado)</td><td class="mono" id="agyr">-</td></tr>
         <tr><td class="k">Angle fused (comp)</td><td class="mono" id="afus">-</td></tr>
+        <tr><td class="k">Zero offset (deg)</td><td class="mono" id="zoff">-</td></tr>
       </table>
       <div class="row">
-        <button id="btnReset">Reset</button>
+        <button id="btnZero">Set 0° (offset)</button>
+        <button id="btnReset">Reset integradores</button>
       </div>
       <div class="small">
-        Nota: angle_acc aquí es el ángulo entre el eje Z del sensor y la gravedad.
+        “Set 0°” aplica un offset = valor fused actual, y lo resta a todas las salidas.
       </div>
     </div>
 
@@ -293,19 +314,19 @@ def index():
       <div class="title">Ajustes</div>
 
       <div class="row">
-        <div style="width:200px">τ accel (s)</div>
+        <div style="width:230px">τ accel (s)</div>
         <input id="tauAcc" type="range" min="0" max="1.0" step="0.005" value="0.10">
         <div class="mono" id="tauAccV">0.10</div>
       </div>
 
       <div class="row">
-        <div style="width:200px">τ gyro (s)</div>
+        <div style="width:230px">τ gyro (s)</div>
         <input id="tauGyr" type="range" min="0" max="0.5" step="0.002" value="0.02">
         <div class="mono" id="tauGyrV">0.02</div>
       </div>
 
       <div class="row">
-        <div style="width:200px">alpha complement.</div>
+        <div style="width:230px">alpha complement.</div>
         <input id="alpha" type="range" min="0" max="1.0" step="0.001" value="0.98">
         <div class="mono" id="alphaV">0.98</div>
       </div>
@@ -365,6 +386,9 @@ document.getElementById("invAng").addEventListener("change", async (e)=>{
 document.getElementById("btnReset").addEventListener("click", async ()=>{
   await fetch("/api/reset", {method:"POST"});
 });
+document.getElementById("btnZero").addEventListener("click", async ()=>{
+  await fetch("/api/zero_here", {method:"POST"});
+});
 
 async function tick(){
   try {
@@ -380,6 +404,7 @@ async function tick(){
     document.getElementById("aacc").textContent = fmt(s.angle_acc_deg, 3);
     document.getElementById("agyr").textContent = fmt(s.angle_gyro_deg, 3);
     document.getElementById("afus").textContent = fmt(s.angle_fused_deg, 3);
+    document.getElementById("zoff").textContent = fmt(s.zero_offset_deg, 3);
 
     document.getElementById("ts").textContent = fmt(s.ts, 3);
     document.getElementById("dt").textContent = fmt(s.dt, 4);
